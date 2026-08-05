@@ -3048,6 +3048,8 @@ async function doCloudLogin() {
       refreshRecordPage();
       renderCommunityFeed();
       refreshDashboard();
+      // 🔧 修复：云端登录成功后也要启动后台同步（否则成员变更不自动更新）
+      startCloudSync();
     }, 800);
   } else {
     msg.textContent = '未找到该昵称的数据，请确认昵称是否正确';
@@ -4046,6 +4048,8 @@ async function syncApprovalToApplicant(applicantName, active, action) {
     if (!data) return;
     const applicantSt = data.app_state;
     if (!applicantSt || !applicantSt.circles) return;
+    // 🔧 修复：跨用户写入时强制修正目标身份，避免 applicant 行内 app_state.nick 串号
+    applicantSt.nick = applicantName;
 
     // 找到申请人的 pending 圈子
     const pendingCircle = applicantSt.circles.find(c => c.pending && c.code === active.code);
@@ -8142,6 +8146,8 @@ function doLogout() {
 function resetToRegistrationPage() {
   // 1. 清空 localStorage
   try { localStorage.removeItem(LS_KEY); } catch(e) {}
+  // 停止后台云同步，避免退出后仍拉取旧账号数据
+  stopCloudSync();
 
   // 2. 重置 appState 到全新用户默认值
   appState.onboardingDone = false;
@@ -8205,6 +8211,78 @@ function resetToRegistrationPage() {
 
 // ======================== Supabase Persistence ========================
 const LS_KEY = 'juanfu_user';
+let cloudSyncTimer = null;
+let cloudSyncActiveNick = '';
+
+function stopCloudSync() {
+  if (cloudSyncTimer) {
+    clearTimeout(cloudSyncTimer);
+    cloudSyncTimer = null;
+  }
+  cloudSyncActiveNick = '';
+}
+
+function startCloudSync() {
+  if (!appState.nick || !appState.onboardingDone) return;
+  stopCloudSync();
+
+  var CLOUD_SYNC_INTERVAL = 10000;
+  cloudSyncActiveNick = appState.nick;
+
+  function scheduleNext() {
+    cloudSyncTimer = setTimeout(cloudSyncOnce, CLOUD_SYNC_INTERVAL);
+  }
+
+  function cloudSyncOnce() {
+    // 用户已退出/切换账号：停止本轮同步
+    if (!appState.onboardingDone || !appState.nick || appState.nick !== cloudSyncActiveNick) {
+      stopCloudSync();
+      return;
+    }
+
+    syncFromSupabase(cloudSyncActiveNick).then(function(cloud) {
+      if (!cloud || !cloud.onboardingDone) {
+        scheduleNext();
+        return;
+      }
+      var localUpdated = (function() {
+        try {
+          var d = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
+          return d.updated_at || '';
+        } catch(e) { return ''; }
+      })();
+
+      if (cloud.updated_at && (!localUpdated || cloud.updated_at > localUpdated)) {
+        var hadPending = (appState.circles || []).some(function(c) { return c.pending; });
+        Object.assign(appState, cloud);
+        // 强制绑定当前登录身份，防止昵称串号
+        appState.nick = cloudSyncActiveNick;
+        try { localStorage.setItem(LS_KEY, JSON.stringify(appState)); } catch(e) {}
+
+        updateAllAvatars();
+        updateCircleCard(hasJoinedCircles());
+        renderSidebarCircles();
+        updateTabbar();
+        refreshDashboard();
+        refreshRecordPage();
+        renderCommunityFeed();
+
+        if (hadPending) {
+          var stillPending = (appState.circles || []).some(function(c) { return c.pending; });
+          if (!stillPending && appState.circles.some(function(c) { return !c.pending && c.role === 'member'; })) {
+            showToast('🎉 你的入圈申请已通过！');
+          }
+        }
+      }
+      scheduleNext();
+    }).catch(function() {
+      scheduleNext();
+    });
+  }
+
+  cloudSyncTimer = setTimeout(cloudSyncOnce, 1500);
+}
+
 function saveAppState() {
   try {
     const data = {
@@ -8263,7 +8341,11 @@ async function syncFromSupabase(nick) {
       .eq('nick', nick)
       .maybeSingle();
     if (error) { console.warn('[Supabase] load:', error.message); return null; }
-    return data ? data.app_state : null;
+    if (!data || !data.app_state) return null;
+    // 🔧 修复：云端 app_state.nick 可能被历史脏数据污染；以查询 nick 为准做自愈
+    const cloud = Object.assign({}, data.app_state);
+    cloud.nick = nick;
+    return cloud;
   } catch(e) {
     console.warn('[Supabase] load:', e.message);
     return null;
@@ -8275,8 +8357,10 @@ async function loginFromCloud(nick) {
   if (!cloudData || !cloudData.onboardingDone) return false;
   // 恢复数据到 appState
   Object.assign(appState, cloudData);
+  // 🔧 修复：强制绑定当前登录 nick，避免读取到其他用户昵称
+  appState.nick = nick;
   // 写本地缓存
-  try { localStorage.setItem(LS_KEY, JSON.stringify(cloudData)); } catch(e) {}
+  try { localStorage.setItem(LS_KEY, JSON.stringify(appState)); } catch(e) {}
   return true;
 }
 function loadAppState() {
@@ -9323,23 +9407,8 @@ const isQA = url.searchParams.get('qa') === '1';
 const withCircles = isQA && url.searchParams.get('circles') === '1';
 const viewParam = url.searchParams.get('view');
 
-// 老用户 demo：预写 localStorage，然后走 loadAppState 真实恢复路径
-// 修复：只有以下情况才 seed demo 数据：
-//   1. 显式 demo 模式 (?circles=1) - QA 测试用
-//   2. 数据损坏：已注册但 circles 非空且首个圈子的 memberList 为空或不存在
-// 关键修复：移除「无 localStorage」分支！
-//   - 新用户首次打开 app 应该走注册流程，绝不能 seed demo 通知/圈子
-//   - 否则会出现「未注册就看到『Panda 反超你』通知」这种反直觉 bug
-// 不再误伤真实用户（包括刚创建 1 人圈子的用户、或已注册但无圈子的用户）
-if (withCircles || (function(){
-  try {
-    var d=JSON.parse(localStorage.getItem('juanfu_user')||'null');
-    if (!d || !d.onboardingDone) return false;
-    var c=d.circles&&d.circles[0];
-    if (!c) return false;
-    return !c.memberList||c.memberList.length===0;
-  } catch(e){return true;}
-})()) {
+// 老用户 demo：仅 QA 显式参数才允许 seed，避免污染真实用户数据
+if (withCircles) {
   seedReturningUserLS();
 }
 
@@ -9359,49 +9428,7 @@ if (loadAppState()) {
   refreshDashboard();
 
   // 后台静默同步 Supabase（多设备数据一致）
-  // 增强：若存在 pending 圈子则周期性轮询（不需要刷新页面就能收到审批结果）
-  if (appState.nick) {
-    var cloudSyncRetries = 0;
-    var CLOUD_SYNC_MAX = 6;      // 最多轮询 6 次
-    var CLOUD_SYNC_INTERVAL = 10000; // 每 10 秒一次
-    function cloudSyncOnce() {
-      syncFromSupabase(appState.nick).then(function(cloud) {
-        if (!cloud || !cloud.onboardingDone) return;
-        var localUpdated = (function() {
-          try { var d = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
-            return d.updated_at || ''; } catch(e) { return ''; }
-        })();
-        if (cloud.updated_at && (!localUpdated || cloud.updated_at > localUpdated)) {
-          // 合并云端数据
-          var hadPending = (appState.circles || []).some(function(c) { return c.pending; });
-          Object.assign(appState, cloud);
-          try { localStorage.setItem(LS_KEY, JSON.stringify(cloud)); } catch(e) {}
-          updateAllAvatars();
-          refreshDashboard();
-          refreshRecordPage();
-          renderCommunityFeed();
-          // 如果之前有 pending 圈子且现在已被审批，刷新圈子卡片
-          if (hadPending) {
-            var stillPending = (appState.circles || []).some(function(c) { return c.pending; });
-            if (!stillPending) {
-              updateCircleCard(true);
-              renderSidebarCircles();
-              if (appState.circles.some(function(c) { return !c.pending && c.role === 'member'; })) {
-                showToast('🎉 你的入圈申请已通过！');
-              }
-            }
-          }
-        }
-        // 如果还有 pending 圈子，继续轮询
-        var hasPendingNow = (appState.circles || []).some(function(c) { return c.pending; });
-        if (hasPendingNow && cloudSyncRetries < CLOUD_SYNC_MAX) {
-          cloudSyncRetries++;
-          setTimeout(cloudSyncOnce, CLOUD_SYNC_INTERVAL);
-        }
-      });
-    }
-    setTimeout(cloudSyncOnce, 1500);
-  }
+  startCloudSync();
 
   // QA 助手：?view=... (仅在已登录状态下生效，用于快速跳到子页面)
   if (isQA && viewParam) {
