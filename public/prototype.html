@@ -3992,10 +3992,13 @@ async function syncApprovalToApplicant(applicantName, active, action) {
       });
     }
 
+    // 更新时间戳：确保后台同步能检测到变化
+    var nowISO = new Date().toISOString();
+    applicantSt.updated_at = nowISO;
     await sb.from('users').upsert({
       nick: applicantName,
       app_state: applicantSt,
-      updated_at: new Date().toISOString()
+      updated_at: nowISO
     });
   } catch(e) { console.warn('[Supabase] syncApproval:', e.message); }
 }
@@ -9188,25 +9191,48 @@ if (loadAppState()) {
   refreshDashboard();
 
   // 后台静默同步 Supabase（多设备数据一致）
+  // 增强：若存在 pending 圈子则周期性轮询（不需要刷新页面就能收到审批结果）
   if (appState.nick) {
-    setTimeout(async function() {
-      var cloud = await syncFromSupabase(appState.nick);
-      if (cloud && cloud.onboardingDone) {
-        // 比较 updated_at，云端更新则合并
+    var cloudSyncRetries = 0;
+    var CLOUD_SYNC_MAX = 6;      // 最多轮询 6 次
+    var CLOUD_SYNC_INTERVAL = 10000; // 每 10 秒一次
+    function cloudSyncOnce() {
+      syncFromSupabase(appState.nick).then(function(cloud) {
+        if (!cloud || !cloud.onboardingDone) return;
         var localUpdated = (function() {
           try { var d = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
             return d.updated_at || ''; } catch(e) { return ''; }
         })();
         if (cloud.updated_at && (!localUpdated || cloud.updated_at > localUpdated)) {
+          // 合并云端数据
+          var hadPending = (appState.circles || []).some(function(c) { return c.pending; });
           Object.assign(appState, cloud);
           try { localStorage.setItem(LS_KEY, JSON.stringify(cloud)); } catch(e) {}
           updateAllAvatars();
           refreshDashboard();
           refreshRecordPage();
           renderCommunityFeed();
+          // 如果之前有 pending 圈子且现在已被审批，刷新圈子卡片
+          if (hadPending) {
+            var stillPending = (appState.circles || []).some(function(c) { return c.pending; });
+            if (!stillPending) {
+              updateCircleCard(true);
+              renderSidebarCircles();
+              if (appState.circles.some(function(c) { return !c.pending && c.role === 'member'; })) {
+                showToast('🎉 你的入圈申请已通过！');
+              }
+            }
+          }
         }
-      }
-    }, 1500);
+        // 如果还有 pending 圈子，继续轮询
+        var hasPendingNow = (appState.circles || []).some(function(c) { return c.pending; });
+        if (hasPendingNow && cloudSyncRetries < CLOUD_SYNC_MAX) {
+          cloudSyncRetries++;
+          setTimeout(cloudSyncOnce, CLOUD_SYNC_INTERVAL);
+        }
+      });
+    }
+    setTimeout(cloudSyncOnce, 1500);
   }
 
   // QA 助手：?view=... (仅在已登录状态下生效，用于快速跳到子页面)
