@@ -3640,7 +3640,9 @@ function removeMember(name) {
       active.members = active.memberList.length;
       openPage('circleManage');
       updateCircleCard(true);
-      showToast('已移除 ' + name);
+      renderSidebarCircles();
+      saveAppState();
+      showToast('已移除 ' + name + '，全员数据同步中');
     }
   });
 }
@@ -3665,6 +3667,7 @@ function editCircleName() {
       openPage('circleManage');
       updateCircleCard(true);
       renderSidebarCircles();
+      saveAppState();
       showToast('圈子名已更新为「' + active.name + '」');
     }
   });
@@ -3678,7 +3681,8 @@ function toggleWeeklyReward() {
     ? `🏆 组长已开启「${active.name}」的周奖惩机制`
     : `⏸ 组长已关闭「${active.name}」的周奖惩机制`);
   openPage('circleManage');
-  showToast(active.weeklyReward ? '已开启周奖惩' : '已关闭周奖惩');
+  saveAppState();
+  showToast(active.weeklyReward ? '已开启周奖惩（同步中）' : '已关闭周奖惩（同步中）');
 }
 
 function editReward() {
@@ -3694,7 +3698,8 @@ function editReward() {
       active.reward = v.trim();
       pushNotification('reward', `🎁 组长更新了「${active.name}」的奖惩：${active.reward}`);
       openPage('circleManage');
-      showToast('奖惩内容已更新');
+      saveAppState();
+      showToast('奖惩内容已更新（同步中）');
     }
   });
 }
@@ -3716,6 +3721,7 @@ function leaveCircle() {
         closeModal();
         updateCircleCard(true);
         renderSidebarCircles();
+        saveAppState();
         showToast('已退出「' + active.name + '」');
       }
     });
@@ -3737,6 +3743,7 @@ function leaveCircle() {
         closeModal();
         updateCircleCard(true);
         renderSidebarCircles();
+        saveAppState();
         showToast('已解散「' + active.name + '」');
       }
     });
@@ -3813,6 +3820,7 @@ function selectTransferLeader(idx) {
       closeModal();
       updateCircleCard(true);
       renderSidebarCircles();
+      saveAppState();
       showToast('已把组长转交给 ' + successor.name + ' 并退出圈子');
       window._transferData = null;
     }
@@ -8222,6 +8230,231 @@ function stopCloudSync() {
   cloudSyncActiveNick = '';
 }
 
+function normalizeCircleMemberListForUser(circle, myNick, myEmoji, myRole) {
+  if (!circle) return;
+  const raw = Array.isArray(circle.memberList) ? circle.memberList : [];
+  const seenNames = new Set();
+  const next = [];
+
+  var leaderName = '';
+  const explicitLeader = raw.find(m => m && m.isLeader && m.name);
+  if (explicitLeader) leaderName = explicitLeader.name;
+  if (!leaderName && myRole === 'leader') leaderName = myNick;
+
+  for (const m of raw) {
+    if (!m || !m.name) continue;
+    if (seenNames.has(m.name)) continue;
+    seenNames.add(m.name);
+    next.push({
+      name: m.name,
+      emoji: m.emoji || (m.name === myNick ? (myEmoji || '👤') : '👤'),
+      score: Number(m.score || 0),
+      joinDate: m.joinDate || getCurrentWeekKey(),
+      isMe: m.name === myNick,
+      isLeader: false
+    });
+  }
+
+  if (myNick && !seenNames.has(myNick)) {
+    next.push({
+      name: myNick,
+      emoji: myEmoji || '👤',
+      score: Number(appState.weeklyPoints || 0),
+      joinDate: getCurrentWeekKey(),
+      isMe: true,
+      isLeader: myRole === 'leader'
+    });
+    seenNames.add(myNick);
+  }
+
+  if (!leaderName) {
+    const fallbackLeader = next.find(m => m.name !== myNick) || next[0];
+    leaderName = fallbackLeader ? fallbackLeader.name : myNick;
+  }
+
+  next.forEach(m => {
+    m.isMe = m.name === myNick;
+    m.isLeader = m.name === leaderName;
+  });
+
+  if (myRole === 'leader') {
+    next.forEach(m => {
+      if (m.name === myNick) m.isLeader = true;
+      else if (m.isLeader) m.isLeader = false;
+    });
+  } else {
+    next.forEach(m => {
+      if (m.name === myNick) m.isLeader = false;
+    });
+    if (!next.some(m => m.isLeader) && next.length > 0) {
+      const fallback = next.find(m => m.name !== myNick) || next[0];
+      fallback.isLeader = true;
+    }
+  }
+
+  circle.memberList = next;
+  circle.members = next.length;
+  if (circle.capacity === undefined) circle.capacity = 30;
+}
+
+function normalizeAllCirclesState() {
+  const before = JSON.stringify({
+    circles: appState.circles || [],
+    activeCircleId: appState.activeCircleId,
+    hasCircle: appState.hasCircle,
+    joinPending: appState.joinPending
+  });
+
+  if (!Array.isArray(appState.circles)) appState.circles = [];
+  const seenCircleId = new Set();
+  appState.circles = appState.circles.filter(c => {
+    if (!c || !c.id) return false;
+    if (seenCircleId.has(c.id)) return false;
+    seenCircleId.add(c.id);
+    return true;
+  });
+
+  appState.circles.forEach(c => {
+    if (!c.role) c.role = c.pending ? 'member' : 'member';
+    if (!Array.isArray(c.joinRequests)) c.joinRequests = [];
+    normalizeCircleMemberListForUser(c, appState.nick, appState.emoji, c.role);
+  });
+
+  if (appState.activeCircleId && !appState.circles.some(c => c.id === appState.activeCircleId)) {
+    appState.activeCircleId = appState.circles[0] ? appState.circles[0].id : null;
+  }
+
+  appState.hasCircle = appState.circles.length > 0;
+  appState.joinPending = appState.circles.some(c => c.pending);
+
+  const after = JSON.stringify({
+    circles: appState.circles || [],
+    activeCircleId: appState.activeCircleId,
+    hasCircle: appState.hasCircle,
+    joinPending: appState.joinPending
+  });
+  return before !== after;
+}
+
+function refreshViewsAfterCloudSync() {
+  updateAllAvatars();
+  updateCircleCard(hasJoinedCircles());
+  renderSidebarCircles();
+  updateTabbar();
+  refreshDashboard();
+  refreshRecordPage();
+  renderCommunityFeed();
+}
+
+function reconcileCrossUserCirclesFromCloudDirectory(allUsers) {
+  if (!Array.isArray(allUsers) || !appState.nick) return false;
+
+  let changed = false;
+  const byNick = {};
+  allUsers.forEach(u => {
+    if (u && u.nick && u.app_state) byNick[u.nick] = u.app_state;
+  });
+
+  const nextCircles = [];
+  const kickedCircles = [];
+
+  for (const localCircle of (appState.circles || [])) {
+    if (!localCircle || localCircle.pending || localCircle.role === 'leader') {
+      nextCircles.push(localCircle);
+      continue;
+    }
+
+    let leaderCircle = null;
+    for (const u of allUsers) {
+      const st = u && u.app_state;
+      if (!st || !Array.isArray(st.circles)) continue;
+      const matched = st.circles.find(c =>
+        c &&
+        c.role === 'leader' &&
+        ((localCircle.id && c.id === localCircle.id) || (localCircle.code && c.code === localCircle.code))
+      );
+      if (matched) {
+        leaderCircle = matched;
+        break;
+      }
+    }
+
+    if (!leaderCircle) {
+      nextCircles.push(localCircle);
+      continue;
+    }
+
+    const memberNames = new Set((leaderCircle.memberList || []).map(m => m && m.name).filter(Boolean));
+    if (!memberNames.has(appState.nick)) {
+      changed = true;
+      kickedCircles.push({ id: localCircle.id, name: localCircle.name || leaderCircle.name || '圈子' });
+      continue;
+    }
+
+    const beforeJson = JSON.stringify(localCircle);
+    const merged = JSON.parse(JSON.stringify(leaderCircle));
+    merged.role = 'member';
+    merged.pending = false;
+    merged.joinRequests = [];
+    normalizeCircleMemberListForUser(merged, appState.nick, appState.emoji, 'member');
+
+    if (beforeJson !== JSON.stringify(merged)) changed = true;
+    nextCircles.push(merged);
+  }
+
+  appState.circles = nextCircles;
+
+  // Leader 侧：从成员云端数据回灌积分/头像，保证跨设备排行榜同步
+  for (const c of (appState.circles || [])) {
+    if (!c || c.pending || c.role !== 'leader' || !Array.isArray(c.memberList)) continue;
+    const beforeMembers = JSON.stringify(c.memberList);
+
+    for (const m of c.memberList) {
+      if (!m || m.name === appState.nick || m.isLeader) continue;
+      const memberSt = byNick[m.name];
+      if (!memberSt || !Array.isArray(memberSt.circles)) continue;
+
+      const memberCircle = memberSt.circles.find(mc =>
+        mc && !mc.pending && ((mc.id && mc.id === c.id) || (mc.code && mc.code === c.code))
+      );
+      if (!memberCircle || !Array.isArray(memberCircle.memberList)) continue;
+
+      const memberSelf = memberCircle.memberList.find(x => x && (x.isMe || x.name === m.name));
+      if (!memberSelf) continue;
+
+      const remoteScore = Number(memberSelf.score || 0);
+      if (remoteScore !== Number(m.score || 0)) {
+        m.score = remoteScore;
+        changed = true;
+      }
+      if (memberSelf.emoji && memberSelf.emoji !== m.emoji) {
+        m.emoji = memberSelf.emoji;
+        changed = true;
+      }
+    }
+
+    normalizeCircleMemberListForUser(c, appState.nick, appState.emoji, 'leader');
+    if (beforeMembers !== JSON.stringify(c.memberList)) changed = true;
+  }
+
+  // 被移出圈子的通知（去重）
+  for (const kc of kickedCircles) {
+    const existed = (appState.notifications || []).some(n => n.type === 'circle_kick' && n.circleId === kc.id);
+    if (!existed) {
+      pushNotification({
+        type: 'circle_kick',
+        circleId: kc.id,
+        title: '你已被移出圈子',
+        body: '你已不在「' + kc.name + '」中，页面已自动同步',
+        time: Date.now()
+      });
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
 function startCloudSync() {
   if (!appState.nick || !appState.onboardingDone) return;
   stopCloudSync();
@@ -8240,40 +8473,54 @@ function startCloudSync() {
       return;
     }
 
-    syncFromSupabase(cloudSyncActiveNick).then(function(cloud) {
-      if (!cloud || !cloud.onboardingDone) {
-        scheduleNext();
-        return;
-      }
-      var localUpdated = (function() {
-        try {
-          var d = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
-          return d.updated_at || '';
-        } catch(e) { return ''; }
-      })();
+    var hadPendingBefore = (appState.circles || []).some(function(c) { return c.pending; });
+    var localUpdated = appState.updated_at || '';
 
-      if (cloud.updated_at && (!localUpdated || cloud.updated_at > localUpdated)) {
-        var hadPending = (appState.circles || []).some(function(c) { return c.pending; });
+    if (typeof sb === 'undefined' || !sb) {
+      scheduleNext();
+      return;
+    }
+
+    Promise.all([
+      syncFromSupabase(cloudSyncActiveNick),
+      sb.from('users').select('nick, app_state')
+    ]).then(function(results) {
+      var cloud = results[0];
+      var directoryRes = results[1] || {};
+      var changed = false;
+
+      // 1) 先同步当前用户自己的云端状态
+      if (cloud && cloud.onboardingDone && cloud.updated_at && (!localUpdated || cloud.updated_at > localUpdated)) {
         Object.assign(appState, cloud);
-        // 强制绑定当前登录身份，防止昵称串号
         appState.nick = cloudSyncActiveNick;
-        try { localStorage.setItem(LS_KEY, JSON.stringify(appState)); } catch(e) {}
+        changed = true;
+      }
 
-        updateAllAvatars();
-        updateCircleCard(hasJoinedCircles());
-        renderSidebarCircles();
-        updateTabbar();
-        refreshDashboard();
-        refreshRecordPage();
-        renderCommunityFeed();
+      // 2) 数据自愈：去重 / 角色 / isMe 一致化
+      if (normalizeAllCirclesState()) changed = true;
 
-        if (hadPending) {
+      // 3) 跨用户实时同步：
+      //    - member 侧从 leader 状态拉最新成员/奖惩/圈子变更
+      //    - leader 侧从成员状态回灌分数，保证排行榜实时
+      if (!directoryRes.error && Array.isArray(directoryRes.data)) {
+        if (reconcileCrossUserCirclesFromCloudDirectory(directoryRes.data)) changed = true;
+        if (normalizeAllCirclesState()) changed = true;
+      }
+
+      if (changed) {
+        appState.nick = cloudSyncActiveNick;
+        appState.updated_at = new Date().toISOString();
+        saveAppState();
+        refreshViewsAfterCloudSync();
+
+        if (hadPendingBefore) {
           var stillPending = (appState.circles || []).some(function(c) { return c.pending; });
           if (!stillPending && appState.circles.some(function(c) { return !c.pending && c.role === 'member'; })) {
             showToast('🎉 你的入圈申请已通过！');
           }
         }
       }
+
       scheduleNext();
     }).catch(function() {
       scheduleNext();
@@ -8285,6 +8532,7 @@ function startCloudSync() {
 
 function saveAppState() {
   try {
+    normalizeAllCirclesState();
     const data = {
       onboardingDone: appState.onboardingDone,
       hasCircle: appState.hasCircle,
@@ -8318,6 +8566,7 @@ function saveAppState() {
     // 本地缓存（同步、即时响应）
     var now = new Date().toISOString();
     data.updated_at = now;
+    appState.updated_at = now;
     localStorage.setItem(LS_KEY, JSON.stringify(data));
     // 云端同步（异步、静默）
     if (typeof sb !== 'undefined' && sb && appState.nick) {
@@ -8359,6 +8608,7 @@ async function loginFromCloud(nick) {
   Object.assign(appState, cloudData);
   // 🔧 修复：强制绑定当前登录 nick，避免读取到其他用户昵称
   appState.nick = nick;
+  normalizeAllCirclesState();
   // 写本地缓存
   try { localStorage.setItem(LS_KEY, JSON.stringify(appState)); } catch(e) {}
   return true;
@@ -8463,6 +8713,8 @@ function loadAppState() {
         }
       });
     }
+    // 恢复后做一次全量自愈（成员去重、角色修正、activeCircleId 修正）
+    normalizeAllCirclesState();
     // 恢复后立即更新通知角标
     updateNotifBadge();
     return true;
@@ -8971,7 +9223,7 @@ function bioBody(params) {
     return getMemberWeekPts(b.name, b.score) - getMemberWeekPts(a.name, a.score);
   }) : [];
   var theirCurRank = allUsers.findIndex(function(m) { return m.name === member.name; }) + 1;
-  var myCurRank = allUsers.findIndex(function(m) { return m.isMe || m.name === appState.nick || m.name === 'Gracey'; }) + 1;
+  var myCurRank = allUsers.findIndex(function(m) { return m.isMe || m.name === appState.nick; }) + 1;
   if (theirCurRank === 0) theirCurRank = allUsers.length;
   if (myCurRank === 0) myCurRank = allUsers.length;
   // 本周积分：和排行榜用同一份逻辑（getMemberWeekPts）
@@ -8986,7 +9238,7 @@ function bioBody(params) {
   snapshots.forEach(function(s) {
     weekLabels.push(s.weekKey.replace('2026-W', 'W'));
     var theirEntry = s.rankings.find(function(r) { return r.name === member.name; });
-    var myEntry = s.rankings.find(function(r) { return r.name === appState.nick || r.name === 'Gracey'; });
+    var myEntry = s.rankings.find(function(r) { return r.name === appState.nick; });
     theirPtsHistory.push(theirEntry ? theirEntry.pts : 0);
     myPtsHistory.push(myEntry ? myEntry.pts : 0);
   });
