@@ -2319,11 +2319,20 @@ function openNotifications() {
       } else if (n.type === 'schedule_message' && n._sent) {
         actionHtml = `<div style="font-size:11px;color:var(--text-3);margin-top:6px">📤 已发送</div>`;
       } else if (n.type === 'join_request' && !n._resolved) {
-        // 申请加入我的公开日程 → 显示批准/拒绝按钮
-        actionHtml = `<div style="display:flex;gap:6px;margin-top:8px">
-          <button class="btn-primary" style="width:auto;padding:6px 12px;font-size:12px;background:var(--green)" onclick="event.stopPropagation();approveJoinFromNotif('${n.notifId}')">✓ 批准</button>
-          <button class="btn-secondary" style="width:auto;padding:6px 12px;font-size:12px" onclick="event.stopPropagation();rejectJoinFromNotif('${n.notifId}')">拒绝</button>
-        </div>`;
+        // 区分两种 join_request：
+        //   - 圈子申请：n.circleId 存在 + n.applicantName 存在 → 走 approveCircleJoinFromNotif
+        //   - 日程申请：其他字段（n.requester/targetMember/dateStr）→ 走 approveJoinFromNotif
+        if (n.circleId && n.applicantName) {
+          actionHtml = `<div style="display:flex;gap:6px;margin-top:8px">
+            <button class="btn-primary" style="width:auto;padding:6px 12px;font-size:12px;background:var(--green)" onclick="event.stopPropagation();approveCircleJoinFromNotif('${n.notifId || n.id}')">✓ 批准</button>
+            <button class="btn-secondary" style="width:auto;padding:6px 12px;font-size:12px" onclick="event.stopPropagation();rejectCircleJoinFromNotif('${n.notifId || n.id}')">拒绝</button>
+          </div>`;
+        } else {
+          actionHtml = `<div style="display:flex;gap:6px;margin-top:8px">
+            <button class="btn-primary" style="width:auto;padding:6px 12px;font-size:12px;background:var(--green)" onclick="event.stopPropagation();approveJoinFromNotif('${n.notifId || n.id}')">✓ 批准</button>
+            <button class="btn-secondary" style="width:auto;padding:6px 12px;font-size:12px" onclick="event.stopPropagation();rejectJoinFromNotif('${n.notifId || n.id}')">拒绝</button>
+          </div>`;
+        }
       } else if (n.type === 'join_request' && n._approved) {
         actionHtml = `<div style="font-size:11px;color:var(--green);margin-top:6px">✓ 已批准</div>`;
       } else if (n.type === 'join_request' && n._rejected) {
@@ -2845,9 +2854,14 @@ function pushNotification(arg1, arg2) {
   }
   appState.notifications.unshift(Object.assign({
     id: 'n-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+    notifId: '',  // 兼容字段：与 id 同值，下方补齐
     read: false,
     createdAt: new Date().toISOString()
   }, n));
+  // 🔧 修复：pushNotification 自动生成的 ID 叫 `id`，但所有 approveJoinFromNotif/rejectJoinFromNotif
+  //     等函数查找的是 `notifId` 字段。补齐 notifId 字段避免「通知不存在」
+  const _latest = appState.notifications[0];
+  if (_latest && !_latest.notifId) _latest.notifId = _latest.id;
   // 限制最多 50 条
   if (appState.notifications.length > 50) appState.notifications = appState.notifications.slice(0, 50);
   // 角标更新
@@ -3500,6 +3514,8 @@ function approveJoinRequest(idx) {
   const req = active.joinRequests[idx];
   // BEFORE 快照：捕获当前排名，新成员加入会让其他成员排名下滑
   captureRankSnapshot(active.id);
+  // 成员去重：如果该名字已在 memberList 中（重复申请），先移除旧 entry
+  active.memberList = (active.memberList || []).filter(m => m.name !== req.name);
   // 加入 memberList
   // 规则：新成员初始 score=0（如果该成员有历史记录，假设系统后续会同步；这里先以 score=0 入榜）
   // 规则：新成员 joinDate=当前周，他们要等加入后的下一个周一结算才能成为周冠军
@@ -3540,6 +3556,58 @@ function rejectJoinRequest(idx) {
 
   // 通过 Supabase 通知申请人：已拒绝
   syncApprovalToApplicant(req.name, active, 'rejected');
+}
+
+// 从通知中心批准「入圈申请」（不同于 schedule 申请的 approveJoinFromNotif）
+// 通过 notifId 找到对应 joinRequest，调用 approveJoinRequest(idx)
+function approveCircleJoinFromNotif(notifId) {
+  const n = (appState.notifications || []).find(x => (x.notifId || x.id) === notifId);
+  if (!n) { showToast('通知不存在'); return; }
+  if (n._resolved) { showToast('已处理过该申请'); return; }
+  n._resolved = true;
+  n._approved = true;
+  n.read = true;
+
+  const applicantName = n.applicantName;
+  if (!applicantName) { showToast('申请信息缺失'); return; }
+
+  // 找到对应的 joinRequest 索引
+  const active = appState.circles.find(c => c.id === n.circleId) || appState.circles.find(c => c.id === appState.activeCircleId);
+  if (!active || !active.joinRequests) { showToast('圈子信息已失效'); return; }
+  const idx = active.joinRequests.findIndex(r => r.name === applicantName);
+  if (idx === -1) {
+    // 已被处理（手动通过圈子管理页通过 / 已经被去重等）
+    showToast('该申请已不存在');
+    return;
+  }
+  // 复用圈子管理页的批准逻辑（同一份代码，避免双实现）
+  approveJoinRequest(idx);
+  // 通知弹层刷新
+  const modal = document.getElementById('recordModal');
+  if (modal && modal.classList.contains('show') && (modal.dataset.type === 'notifications' || modal.dataset.type === 'circleManage')) {
+    openNotifications();
+  }
+}
+
+function rejectCircleJoinFromNotif(notifId) {
+  const n = (appState.notifications || []).find(x => (x.notifId || x.id) === notifId);
+  if (!n) { showToast('通知不存在'); return; }
+  if (n._resolved) { showToast('已处理过该申请'); return; }
+  n._resolved = true;
+  n._rejected = true;
+  n.read = true;
+
+  const applicantName = n.applicantName;
+  if (!applicantName) { showToast('申请信息缺失'); return; }
+  const active = appState.circles.find(c => c.id === n.circleId) || appState.circles.find(c => c.id === appState.activeCircleId);
+  if (!active || !active.joinRequests) { showToast('圈子信息已失效'); return; }
+  const idx = active.joinRequests.findIndex(r => r.name === applicantName);
+  if (idx === -1) { showToast('该申请已不存在'); return; }
+  rejectJoinRequest(idx);
+  const modal = document.getElementById('recordModal');
+  if (modal && modal.classList.contains('show') && (modal.dataset.type === 'notifications' || modal.dataset.type === 'circleManage')) {
+    openNotifications();
+  }
 }
 
 function removeMember(name) {
@@ -3902,29 +3970,42 @@ async function notifyCircleOwnerAboutJoinRequest(code) {
       console.log('[JFR] check', u.nick, '- circles:', st.circles.map(c => c.code+'/'+c.role), '- match:', !!leaderCircle);
       if (!leaderCircle) continue;
 
-      // 去重：已在 joinRequests 中
+      // 去重：已在 joinRequests 中（申请人的申请已存在 → 不重复通知）
       const alreadyApplied = (leaderCircle.joinRequests || []).some(r => r.name === appState.nick);
       if (alreadyApplied) { console.log('[JFR] already applied'); return; }
 
-      // 写入 joinRequests
+      // 🔧 修复：通知去重 — 如果已有同申请人的未处理 join_request 通知，更新时间，不重复添加
+      if (!st.notifications) st.notifications = [];
+      const existingNotif = st.notifications.find(x =>
+        x.type === 'join_request' && x.applicantName === appState.nick && !x._resolved
+      );
+      if (existingNotif) {
+        console.log('[JFR] notify dedup: update existing notif', existingNotif.notifId);
+        existingNotif.time = Date.now();
+        existingNotif.body = appState.nick + ' 申请加入「' + leaderCircle.name + '」（最新）';
+        // 仍需写回 Supabase（更新 joinRequests 时间戳不写；只写通知时间）
+      } else {
+        // 写入新通知
+        st.notifications.unshift({
+          type: 'join_request',
+          title: '📩 新的入圈申请',
+          body: appState.nick + ' 申请加入「' + leaderCircle.name + '」',
+          time: Date.now(),
+          fromName: appState.nick,
+          circleId: leaderCircle.id,
+          applicantName: appState.nick,
+          applicantEmoji: appState.emoji
+        });
+      }
+
+      // 写入 joinRequests（覆盖旧记录，确保只有最新一条）
       if (!leaderCircle.joinRequests) leaderCircle.joinRequests = [];
+      // 移除旧同申请人记录，再插入新记录（保证 joinRequests 数组里同一申请人只有一条）
+      leaderCircle.joinRequests = leaderCircle.joinRequests.filter(r => r.name !== appState.nick);
       leaderCircle.joinRequests.push({
         name: appState.nick,
         emoji: appState.emoji,
         time: new Date().toLocaleString('zh-CN', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit' })
-      });
-
-      // 写入通知
-      if (!st.notifications) st.notifications = [];
-      st.notifications.unshift({
-        type: 'join_request',
-        title: '📩 新的入圈申请',
-        body: appState.nick + ' 申请加入「' + leaderCircle.name + '」',
-        time: Date.now(),
-        fromName: appState.nick,
-        circleId: leaderCircle.id,
-        applicantName: appState.nick,
-        applicantEmoji: appState.emoji
       });
 
       // 写回 Supabase
@@ -3961,8 +4042,49 @@ async function syncApprovalToApplicant(applicantName, active, action) {
       pendingCircle.name = active.name;
       pendingCircle.id = active.id;
       pendingCircle.role = 'member';
-      pendingCircle.memberList = active.memberList;
-      pendingCircle.capacity = active.capacity;
+
+      // 🔧 修复：memberList 重新构建，不再直接覆盖（避免错误数据）
+      // 1) 从 active.memberList 中找到 leader entry（自己的），用 leader 当前真实数据
+      // 2) 其他人用 active.memberList 中对应 entry
+      // 3) 申请人自己（applicantName）从 active.memberList 中找出，加 isMe: true + role: 'member' + 真实周分
+      const leaderEntry = (active.memberList || []).find(m => m.isLeader) || { name: appState.nick, emoji: appState.emoji, score: 0 };
+      const leaderWeekPts = getMyWeekPts();  // leader 自己最新的周分
+      const newMemberList = [];
+      // 先放 leader
+      newMemberList.push({
+        name: leaderEntry.name,
+        emoji: appState.emoji,  // 用 leader appState 实时 emoji（不依赖 active.memberList 里可能过时的数据）
+        isMe: false,
+        isLeader: true,
+        score: leaderWeekPts,
+        joinDate: leaderEntry.joinDate || getCurrentWeekKey()
+      });
+      // 再放其他人（除 leader + applicant 之外）
+      for (const m of (active.memberList || [])) {
+        if (m.isLeader) continue;
+        if (m.name === applicantName) continue;
+        newMemberList.push({
+          name: m.name,
+          emoji: m.emoji,
+          isMe: false,
+          isLeader: false,
+          score: m.score || 0,
+          joinDate: m.joinDate || getCurrentWeekKey()
+        });
+      }
+      // 最后放 applicant 自己（用申请时的 emoji + 当前周分 = 0）
+      const applicantEmoji = pendingCircle.memberList && pendingCircle.memberList[0] ? pendingCircle.memberList[0].emoji : '👤';
+      newMemberList.push({
+        name: applicantName,
+        emoji: applicantEmoji,
+        isMe: true,
+        isLeader: false,
+        score: 0,  // 加入时为 0；appState.weeklyPoints 等后台轮询时由申请人自己同步
+        joinDate: getCurrentWeekKey()
+      });
+      pendingCircle.memberList = newMemberList;
+      pendingCircle.capacity = active.capacity || 30;
+      pendingCircle.members = newMemberList.length;
       applicantSt.joinPending = false;
     } else {
       // 拒绝：移除这个 pending 圈子
@@ -6576,7 +6698,7 @@ function acceptInviteFromModal(memberName, inviteId) {
 
 // 从通知点"加入日程"按钮
 function acceptInviteFromNotif(notifId) {
-  const n = (appState.notifications || []).find(x => x.notifId === notifId);
+  const n = (appState.notifications || []).find(x => (x.notifId || x.id) === notifId);
   if (!n) { showToast('通知不存在'); return; }
   if (n._accepted) { showToast('已加入'); return; }
   n._accepted = true;
@@ -6598,7 +6720,7 @@ function acceptInviteFromNotif(notifId) {
 
 // ====== 接受/拒绝后给对方发消息 ======
 function sendScheduleMessage(notifId, targetName) {
-  const n = (appState.notifications || []).find(x => x.notifId === notifId);
+  const n = (appState.notifications || []).find(x => (x.notifId || x.id) === notifId);
   if (!n) { showToast('通知已失效'); return; }
   // 确定对方名称：优先 fromName（邀约来自谁），否则 targetMember
   const toName = targetName || n.fromName || n.targetMember || '';
@@ -6637,7 +6759,7 @@ function sendScheduleMessage(notifId, targetName) {
 
 // 拒绝邀请（先弹留言弹窗）
 function declineInviteFromNotif(notifId) {
-  const n = (appState.notifications || []).find(x => x.notifId === notifId);
+  const n = (appState.notifications || []).find(x => (x.notifId || x.id) === notifId);
   if (!n) { showToast('通知不存在'); return; }
   if (n._accepted || n._declined) { showToast(n._accepted ? '已接受' : '已拒绝过'); return; }
 
@@ -6653,7 +6775,7 @@ function declineInviteFromNotif(notifId) {
 }
 
 function doDeclineInviteFromNotif(notifId, message) {
-  const n = (appState.notifications || []).find(x => x.notifId === notifId);
+  const n = (appState.notifications || []).find(x => (x.notifId || x.id) === notifId);
   if (!n || n._declined) return;
   n._declined = true;
   n._accepted = false;
@@ -6797,7 +6919,7 @@ function showJoinRequestWaitingPanel(memberName, invite, dateStr, target) {
 
 // 3) 批准加入申请（通知中心点"批准"按钮）
 function approveJoinFromNotif(notifId) {
-  const n = (appState.notifications || []).find(x => x.notifId === notifId);
+  const n = (appState.notifications || []).find(x => (x.notifId || x.id) === notifId);
   if (!n) { showToast('通知不存在'); return; }
   if (n._resolved) { showToast('已处理过该申请'); return; }
   n._resolved = true;
@@ -6895,7 +7017,7 @@ function approveJoinFromNotif(notifId) {
 
 // 4) 拒绝加入申请（先弹出留言弹窗）
 function rejectJoinFromNotif(notifId) {
-  const n = (appState.notifications || []).find(x => x.notifId === notifId);
+  const n = (appState.notifications || []).find(x => (x.notifId || x.id) === notifId);
   if (!n) { showToast('通知不存在'); return; }
   if (n._resolved) { showToast('已处理过该申请'); return; }
 
@@ -6914,7 +7036,7 @@ function rejectJoinFromNotif(notifId) {
 }
 
 function doRejectJoinRequest(notifId, message) {
-  const n = (appState.notifications || []).find(x => x.notifId === notifId);
+  const n = (appState.notifications || []).find(x => (x.notifId || x.id) === notifId);
   if (!n || n._resolved) return;
   n._resolved = true;
   n._rejected = true;
@@ -8441,11 +8563,18 @@ function notifBody() {
         } else if (n.type === 'invite_received' && n._declined) {
           actionHtml = `<div style="font-size:11px;color:var(--red);margin-top:6px">✕ 已拒绝</div>`;
         } else if (n.type === 'join_request' && !n._resolved) {
-          // 申请加入我的公开日程 → 显示批准/拒绝按钮
-          actionHtml = `<div style="display:flex;gap:6px;margin-top:8px">
-            <button class="btn-primary" style="width:auto;padding:6px 12px;font-size:12px;background:var(--green)" onclick="event.stopPropagation();approveJoinFromNotif('${n.notifId}')">✓ 批准</button>
-            <button class="btn-secondary" style="width:auto;padding:6px 12px;font-size:12px" onclick="event.stopPropagation();rejectJoinFromNotif('${n.notifId}')">拒绝</button>
-          </div>`;
+          // 区分圈子申请 vs 日程申请（与 openNotifications 同步）
+          if (n.circleId && n.applicantName) {
+            actionHtml = `<div style="display:flex;gap:6px;margin-top:8px">
+              <button class="btn-primary" style="width:auto;padding:6px 12px;font-size:12px;background:var(--green)" onclick="event.stopPropagation();approveCircleJoinFromNotif('${n.notifId || n.id}')">✓ 批准</button>
+              <button class="btn-secondary" style="width:auto;padding:6px 12px;font-size:12px" onclick="event.stopPropagation();rejectCircleJoinFromNotif('${n.notifId || n.id}')">拒绝</button>
+            </div>`;
+          } else {
+            actionHtml = `<div style="display:flex;gap:6px;margin-top:8px">
+              <button class="btn-primary" style="width:auto;padding:6px 12px;font-size:12px;background:var(--green)" onclick="event.stopPropagation();approveJoinFromNotif('${n.notifId || n.id}')">✓ 批准</button>
+              <button class="btn-secondary" style="width:auto;padding:6px 12px;font-size:12px" onclick="event.stopPropagation();rejectJoinFromNotif('${n.notifId || n.id}')">拒绝</button>
+            </div>`;
+          }
         } else if (n.type === 'join_request' && n._approved) {
           actionHtml = `<div style="font-size:11px;color:var(--green);margin-top:6px">✓ 已批准</div>`;
         } else if (n.type === 'join_request' && n._rejected) {
@@ -8523,7 +8652,7 @@ function circleBody() {
           // 同步通知
           if (myData.app_state.notifications) {
             for (const cn of myData.app_state.notifications) {
-              if (cn.type === 'join_request' && !appState.notifications.some(ln => ln.type === 'join_request' && ln.applicantName === cn.applicantName && ln.time === cn.time)) {
+              if (cn.type === 'join_request' && !appState.notifications.some(ln => ln.type === 'join_request' && ln.applicantName === cn.applicantName && ln.notifId === cn.notifId)) {
                 appState.notifications.unshift(cn);
                 changed = true;
               }
@@ -8545,6 +8674,8 @@ function circleBody() {
                   const aemoji = applicant ? applicant.emoji : (st.emoji || '👤');
                   if (!localNames.has(aname)) {
                     if (!active.joinRequests) active.joinRequests = [];
+                    // 策略2 去重：移除旧的同申请人记录，只留最新一条
+                    active.joinRequests = active.joinRequests.filter(r => r.name !== aname);
                     active.joinRequests.push({
                       name: aname,
                       emoji: aemoji,
@@ -8552,8 +8683,12 @@ function circleBody() {
                     });
                     localNames.add(aname);
                     changed = true;
-                    // 同时写入通知
-                    if (!appState.notifications.some(n => n.type === 'join_request' && n.applicantName === aname)) {
+                    // 同时写入通知（去重：同申请人只有一条未处理通知）
+                    const existing = appState.notifications.find(n => n.type === 'join_request' && n.applicantName === aname && !n._resolved);
+                    if (existing) {
+                      existing.time = Date.now();
+                      existing.body = aname + ' 申请加入「' + active.name + '」（最新）';
+                    } else {
                       appState.notifications.unshift({
                         type: 'join_request',
                         title: '📩 新的入圈申请',
