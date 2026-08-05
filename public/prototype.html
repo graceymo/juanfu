@@ -3344,8 +3344,12 @@ function updateCircleCard(hasCircle) {
   const title = document.getElementById('circleTitle');
   const arrow = document.getElementById('circleManageArrow');
 
-  // 找到当前 active 圈子
-  const active = appState.circles.find(c => c.id === appState.activeCircleId);
+  // 找到当前 active 圈子；如果 activeCircleId 指向的圈子不存在但有其他圈子，回退到第一个
+  let active = appState.circles.find(c => c.id === appState.activeCircleId);
+  if (!active && appState.circles.length > 0) {
+    active = appState.circles[0];
+    appState.activeCircleId = active.id;
+  }
 
   if (!hasCircle || !active) {
     title.textContent = '我的圈子';
@@ -4042,6 +4046,8 @@ async function syncApprovalToApplicant(applicantName, active, action) {
       pendingCircle.name = active.name;
       pendingCircle.id = active.id;
       pendingCircle.role = 'member';
+      // 🔧 修复：同步 activeCircleId，否则仪表盘 updateCircleCard 找不到圈子 → 显示空态
+      applicantSt.activeCircleId = active.id;
 
       // 🔧 修复：memberList 重新构建，不再直接覆盖（避免错误数据）
       // 1) 从 active.memberList 中找到 leader entry（自己的），用 leader 当前真实数据
