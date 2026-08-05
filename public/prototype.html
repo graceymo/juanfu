@@ -3520,6 +3520,10 @@ function approveJoinRequest(idx) {
   updateCircleCard(true);
   renderSidebarCircles();
   showToast('✅ 已通过 ' + req.name + ' 的入圈申请');
+  saveAppState();
+
+  // 通过 Supabase 通知申请人：已通过，更新其 pending 状态
+  syncApprovalToApplicant(req.name, active, 'approved');
 }
 
 function rejectJoinRequest(idx) {
@@ -3529,6 +3533,10 @@ function rejectJoinRequest(idx) {
   active.joinRequests.splice(idx, 1);
   openPage('circleManage');
   showToast('🚫 已拒绝 ' + req.name + ' 的入圈申请');
+  saveAppState();
+
+  // 通过 Supabase 通知申请人：已拒绝
+  syncApprovalToApplicant(req.name, active, 'rejected');
 }
 
 function removeMember(name) {
@@ -3862,6 +3870,9 @@ function doJoinCircle() {
     codeInput.disabled = true;
 
     showToast('⏳ 申请已发送，等待组长审批');
+
+    // 通过 Supabase 通知圈子组长
+    notifyCircleOwnerAboutJoinRequest(code);
   }
 
   // Update dashboard + sidebar
@@ -3869,6 +3880,118 @@ function doJoinCircle() {
   renderSidebarCircles();
   refreshDashboard();  // 更新 top stats
   saveAppState();  // 修复 P0：加入圈子后持久化（含待审批）
+}
+
+// 通过 Supabase 搜索邀请码对应的组长，写入 joinRequests + 通知
+async function notifyCircleOwnerAboutJoinRequest(code) {
+  if (typeof sb === 'undefined' || !sb || !appState.nick) return;
+  try {
+    // 搜索所有用户（RLS public_access 允许跨用户读写）
+    const { data: allUsers, error } = await sb.from('users').select('nick, app_state');
+    if (error || !allUsers) return;
+
+    for (const u of allUsers) {
+      const st = u.app_state;
+      if (!st || !st.circles) continue;
+      const leaderCircle = st.circles.find(c => c.code === code && c.role === 'leader');
+      if (!leaderCircle) continue;
+
+      // 去重：已在 joinRequests 中
+      const alreadyApplied = (leaderCircle.joinRequests || []).some(r => r.name === appState.nick);
+      if (alreadyApplied) return;
+
+      // 写入 joinRequests
+      if (!leaderCircle.joinRequests) leaderCircle.joinRequests = [];
+      leaderCircle.joinRequests.push({
+        name: appState.nick,
+        emoji: appState.emoji,
+        time: new Date().toLocaleString('zh-CN', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit' })
+      });
+
+      // 写入通知
+      if (!st.notifications) st.notifications = [];
+      st.notifications.unshift({
+        type: 'join_request',
+        title: '📩 新的入圈申请',
+        body: appState.nick + ' 申请加入「' + leaderCircle.name + '」',
+        time: Date.now(),
+        fromName: appState.nick,
+        circleId: leaderCircle.id,
+        applicantName: appState.nick,
+        applicantEmoji: appState.emoji
+      });
+
+      // 写回 Supabase
+      await sb.from('users').upsert({
+        nick: u.nick,
+        app_state: st,
+        updated_at: new Date().toISOString()
+      });
+      return; // 只通知第一个匹配的组长
+    }
+  } catch(e) {
+    console.warn('[Supabase] notifyCircleOwner:', e.message);
+  }
+}
+
+// 组长通过/拒绝入圈申请后，通过 Supabase 更新申请人的状态
+async function syncApprovalToApplicant(applicantName, active, action) {
+  if (typeof sb === 'undefined' || !sb) return;
+  try {
+    const { data } = await sb.from('users').select('app_state').eq('nick', applicantName).maybeSingle();
+    if (!data) return;
+    const applicantSt = data.app_state;
+    if (!applicantSt || !applicantSt.circles) return;
+
+    // 找到申请人的 pending 圈子
+    const pendingCircle = applicantSt.circles.find(c => c.pending && c.code === active.code);
+    if (!pendingCircle) return;
+
+    if (action === 'approved') {
+      pendingCircle.pending = false;
+      pendingCircle.name = active.name;
+      pendingCircle.id = active.id;
+      pendingCircle.role = 'member';
+      pendingCircle.memberList = active.memberList;
+      pendingCircle.capacity = active.capacity;
+      applicantSt.joinPending = false;
+    } else {
+      // 拒绝：移除这个 pending 圈子
+      applicantSt.circles = applicantSt.circles.filter(c => c.id !== pendingCircle.id);
+      if (applicantSt.activeCircleId === pendingCircle.id) {
+        applicantSt.activeCircleId = null;
+        applicantSt.hasCircle = false;
+        applicantSt.joinPending = false;
+      }
+    }
+
+    // 添加通知
+    if (!applicantSt.notifications) applicantSt.notifications = [];
+    if (action === 'approved') {
+      applicantSt.notifications.unshift({
+        type: 'join_approved',
+        title: '🎉 入圈申请已通过',
+        body: '你已成功加入「' + active.name + '」',
+        time: Date.now(),
+        circleName: active.name,
+        circleId: active.id
+      });
+    } else {
+      applicantSt.notifications.unshift({
+        type: 'join_rejected',
+        title: '📩 入圈申请结果',
+        body: '你申请加入「' + active.name + '」未被通过',
+        time: Date.now(),
+        circleName: active.name
+      });
+    }
+
+    await sb.from('users').upsert({
+      nick: applicantName,
+      app_state: applicantSt,
+      updated_at: new Date().toISOString()
+    });
+  } catch(e) { console.warn('[Supabase] syncApproval:', e.message); }
 }
 
 // ======================== Tab Switching ========================
@@ -8362,6 +8485,47 @@ function circleBody() {
   const active = appState.circles.find(c => c.id === appState.activeCircleId) || appState.circles[0];
   if (!active) return '<div style="text-align:center;padding:40px;color:var(--text-3)">没有圈子</div>';
   const isLeader = active.role === 'leader';
+
+  // 组长：从 Supabase 拉取最新的 joinRequests（其他成员通过 Supabase 写入的）
+  if (isLeader && typeof sb !== 'undefined' && sb && !active._syncing) {
+    active._syncing = true;
+    (async function() {
+      try {
+        const { data, error } = await sb.from('users').select('app_state').eq('nick', appState.nick).maybeSingle();
+        if (!error && data) {
+          const cloudSt = data.app_state;
+          if (cloudSt && cloudSt.circles) {
+            const cloudCircle = cloudSt.circles.find(c => c.id === active.id);
+            if (cloudCircle && cloudCircle.joinRequests && cloudCircle.joinRequests.length > 0) {
+              const localNames = new Set((active.joinRequests || []).map(r => r.name));
+              let changed = false;
+              for (const req of cloudCircle.joinRequests) {
+                if (!localNames.has(req.name)) {
+                  if (!active.joinRequests) active.joinRequests = [];
+                  active.joinRequests.push(req);
+                  changed = true;
+                }
+              }
+              // 同步通知
+              if (cloudSt.notifications) {
+                for (const cn of cloudSt.notifications) {
+                  if (cn.type === 'join_request' && !appState.notifications.some(ln => ln.type === 'join_request' && ln.applicantName === cn.applicantName && ln.time === cn.time)) {
+                    appState.notifications.unshift(cn);
+                    changed = true;
+                  }
+                }
+              }
+              if (changed) {
+                saveAppState();
+                openPage('circleManage'); // 重新渲染
+              }
+            }
+          }
+        }
+      } catch(e) {}
+      active._syncing = false;
+    })();
+  }
   const list = active.memberList || [];
   const myInList = list.find(m => m.isMe);
   const peers = list.filter(m => !m.isMe);
