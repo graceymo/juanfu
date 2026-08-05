@@ -3349,7 +3349,10 @@ function updateCircleCard(hasCircle) {
     arrow.style.display = 'none';
   } else {
     title.textContent = '我的圈子 · ' + active.name;
-    subtitle.textContent = `${(active.memberList || []).length} / ${active.capacity || active.members || 30} 人 · 邀请码 ${active.code}`;
+    // 容量兜底：capacity 缺失时用 max(30, 实际成员数) 避免分母小于分子
+    const memberCount = (active.memberList || []).length;
+    const cap = active.capacity || Math.max(30, memberCount);
+    subtitle.textContent = `${memberCount} / ${cap} 人 · 邀请码 ${active.code}`;
     empty.style.display = 'none';
     pending.style.display = 'none';
     arrow.style.display = 'flex';
@@ -8659,7 +8662,7 @@ function circleBody() {
   return `
     ${titleRow}
     <div class="form-group">
-      <label class="form-label">成员（${list.length} / ${active.capacity || (active.memberList || []).length || 30}）</label>
+      <label class="form-label">成员（${list.length} / ${active.capacity || Math.max(30, list.length)}）</label>
       <div class="card-elev-2" style="border-radius:12px;padding:0 14px">
         <div class="stat-row" style="border:0">
           ${myAvatar}
