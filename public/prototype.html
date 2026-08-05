@@ -4682,7 +4682,7 @@ function dailyBody() {
     </div>
     <div class="points-inline">
       <span class="pi-label">预计获得</span>
-      <span class="pi-value">+${totalPts} 分</span>
+      <span class="pi-value" id="dailyPointsValue">+${totalPts} 分</span>
     </div>
     ${photoHtml}
     <button class="btn-primary" style="margin-top:12px" onclick="submitDailyRecord()">${_editingRecordId?'保存修改':'提交'}</button>
@@ -4709,13 +4709,27 @@ function selectDailyExercise(ex) {
   _dailyForm.exercise = ex;
   rerenderRecordModal();
 }
+function refreshDailyInlineSummary() {
+  const modal = document.getElementById('recordModal');
+  if (!modal || modal.dataset.type !== 'daily') return;
+  const g = _dailyForm;
+  const isCardio = CARDIO_GROUPS.has(g.group);
+  const isTimeBased = TIME_BASED_EXERCISES.has(g.exercise);
+  const useMinutes = isCardio || isTimeBased;
+  const ptsPerRep = EXERCISE_POINTS_PER_REP[g.exercise] || DAILY_BASE_POINTS;
+  const totalPts = useMinutes
+    ? Math.round(g.sets * ptsPerRep)
+    : Math.round(g.reps * g.sets * ptsPerRep);
+  const pointsValue = document.getElementById('dailyPointsValue');
+  if (pointsValue) pointsValue.textContent = `+${totalPts} 分`;
+}
 function updateDailyReps(v) {
   _dailyForm.reps = Math.max(1, parseInt(v) || 0);
-  rerenderRecordModal();
+  refreshDailyInlineSummary();
 }
 function updateDailySets(v) {
   _dailyForm.sets = Math.max(1, parseInt(v) || 0);
-  rerenderRecordModal();
+  refreshDailyInlineSummary();
 }
 // ======================== 照片上传（来源选择器） ========================
 // 点击照片区域 → 弹选择器（拍摄 / 从相册选择 / 取消）
@@ -5033,40 +5047,8 @@ function specialBody() {
   const ptsPerMin = SPECIAL_POINTS_PER_MIN[f.sport] || SPECIAL_BASE_POINTS;
   const totalPts = Math.round(f.minutes * ptsPerMin);
   const sysCal = calcSportCalories(f.sport, f.minutes);
-  const watchVal = parseFloat(f.watchCal);
-  let calWarningHtml = '';
-  // 仅当手表卡路里 ≥ 50 kcal（合理值范围）且与系统估算差异 > 30% 时提示
-  if (f.watchCal && !isNaN(watchVal) && watchVal >= 50 && sysCal > 0) {
-    const diff = Math.abs(watchVal - sysCal) / sysCal;
-    if (diff > 0.3 && !f.calWarningShown) {
-      calWarningHtml = `
-        <div class="cal-warning">
-          <div class="cw-title">⚠️ 卡路里差异较大</div>
-          <div>手表记录 ${watchVal} kcal，系统估算 ${sysCal} kcal，差异 ${Math.round(diff*100)}%</div>
-          <div class="cw-actions">
-            <button class="cw-btn ignore" onclick="ignoreCalWarning()">忽略，用手表数据</button>
-            <button class="cw-btn fix" onclick="fixCalToSystem()">修正为系统估算</button>
-          </div>
-        </div>`;
-    } else if (diff > 0.3 && f.calWarningShown) {
-      calWarningHtml = `<div class="cal-warning"><div class="cw-title">⚠️ 卡路里差异较大</div><div>已确认使用当前数据，差异 ${Math.round(diff*100)}%</div></div>`;
-    }
-  }
-  // 手表卡路里输入即时提示：合理区间 50-999 kcal，过小或过大都提示
-  let watchHintHtml = '';
-  const wcTrim = String(f.watchCal || '').trim();
-  if (wcTrim) {
-    const wcNum = parseFloat(wcTrim);
-    if (isNaN(wcNum) || wcNum < 0) {
-      watchHintHtml = `<div class="form-hint form-hint-warn">⚠️ 请输入有效数字</div>`;
-    } else if (wcNum > 999) {
-      watchHintHtml = `<div class="form-hint form-hint-warn">⚠️ 数值过大，建议检查（1-3 位数）</div>`;
-    } else if (wcNum < 50) {
-      watchHintHtml = `<div class="form-hint form-hint-warn">⚠️ 看起来不像手表的实际数值（合理范围 50-999）</div>`;
-    } else {
-      watchHintHtml = `<div class="form-hint form-hint-ok">✓ 已记录 ${wcNum} kcal</div>`;
-    }
-  }
+  const watchHintHtml = buildSpecialWatchHintHtml(f, sysCal);
+  const calWarningHtml = buildSpecialCalWarningHtml(f, sysCal);
   const catHtml = Object.keys(SPECIAL_CATEGORIES).map(k =>
     `<button class="chip${k===f.category?' active':''}" onclick="selectSpecialCategory('${k}')">${k}</button>`
   ).join('');
@@ -5093,14 +5075,14 @@ function specialBody() {
     </div>
     <div class="form-group">
       <label class="form-label">时长（分钟）</label>
-      <input class="form-input" type="number" value="${f.minutes}" oninput="updateSpecialMinutes(this.value)" min="1">
+      <input class="form-input" id="specialMinutesInput" type="number" value="${f.minutes}" oninput="updateSpecialMinutes(this.value)" min="1">
     </div>
     <div class="form-group">
       <label class="form-label">手表卡路里（选填，1-3 位数）</label>
-      <input class="form-input" type="number" placeholder="例如 ${sysCal}" value="${f.watchCal}" oninput="updateWatchCal(this.value)" min="0" max="999">
-      ${watchHintHtml}
+      <input class="form-input" id="specialWatchCalInput" type="number" placeholder="例如 ${sysCal}" value="${f.watchCal}" oninput="updateWatchCal(this.value)" min="0" max="999">
+      <div id="specialWatchHint">${watchHintHtml}</div>
     </div>
-    ${calWarningHtml}
+    <div id="specialCalWarning">${calWarningHtml}</div>
     <div class="form-group">
       <label class="form-label">记录时间</label>
       <div style="display:flex;gap:8px">
@@ -5109,8 +5091,8 @@ function specialBody() {
       </div>
     </div>
     <div class="points-inline">
-      <span class="pi-label">预计获得 · 系统估算消耗 ${sysCal} kcal</span>
-      <span class="pi-value">+${totalPts} 分</span>
+      <span class="pi-label" id="specialPointsLabel">预计获得 · 系统估算消耗 ${sysCal} kcal</span>
+      <span class="pi-value" id="specialPointsValue">+${totalPts} 分</span>
     </div>
     ${photoHtml}
     <button class="btn-primary" style="margin-top:12px" onclick="submitSpecialRecord()">${_editingRecordId?'保存修改':'提交'}</button>
@@ -5138,25 +5120,76 @@ function selectSpecialSport(sport) {
   _specialForm.calWarningShown = false;
   rerenderRecordModal();
 }
+function buildSpecialWatchHintHtml(form, sysCal) {
+  const wcTrim = String(form.watchCal || '').trim();
+  if (!wcTrim) return '';
+  const wcNum = parseFloat(wcTrim);
+  if (isNaN(wcNum) || wcNum < 0) {
+    return `<div class="form-hint form-hint-warn">⚠️ 请输入有效数字</div>`;
+  }
+  if (wcNum > 999) {
+    return `<div class="form-hint form-hint-warn">⚠️ 数值过大，建议检查（1-3 位数）</div>`;
+  }
+  if (wcNum < 50) {
+    return `<div class="form-hint form-hint-warn">⚠️ 看起来不像手表的实际数值（合理范围 50-999）</div>`;
+  }
+  return `<div class="form-hint form-hint-ok">✓ 已记录 ${wcNum} kcal</div>`;
+}
+function buildSpecialCalWarningHtml(form, sysCal) {
+  const watchVal = parseFloat(form.watchCal);
+  if (!(form.watchCal && !isNaN(watchVal) && watchVal >= 50 && sysCal > 0)) return '';
+  const diff = Math.abs(watchVal - sysCal) / sysCal;
+  if (diff <= 0.3) return '';
+  if (!form.calWarningShown) {
+    return `
+      <div class="cal-warning">
+        <div class="cw-title">⚠️ 卡路里差异较大</div>
+        <div>手表记录 ${watchVal} kcal，系统估算 ${sysCal} kcal，差异 ${Math.round(diff*100)}%</div>
+        <div class="cw-actions">
+          <button class="cw-btn ignore" onclick="ignoreCalWarning()">忽略，用手表数据</button>
+          <button class="cw-btn fix" onclick="fixCalToSystem()">修正为系统估算</button>
+        </div>
+      </div>`;
+  }
+  return `<div class="cal-warning"><div class="cw-title">⚠️ 卡路里差异较大</div><div>已确认使用当前数据，差异 ${Math.round(diff*100)}%</div></div>`;
+}
+function refreshSpecialInlineSummary() {
+  const modal = document.getElementById('recordModal');
+  if (!modal || modal.dataset.type !== 'special') return;
+  const f = _specialForm;
+  const ptsPerMin = SPECIAL_POINTS_PER_MIN[f.sport] || SPECIAL_BASE_POINTS;
+  const totalPts = Math.round(f.minutes * ptsPerMin);
+  const sysCal = calcSportCalories(f.sport, f.minutes);
+  const pointsLabel = document.getElementById('specialPointsLabel');
+  if (pointsLabel) pointsLabel.textContent = `预计获得 · 系统估算消耗 ${sysCal} kcal`;
+  const pointsValue = document.getElementById('specialPointsValue');
+  if (pointsValue) pointsValue.textContent = `+${totalPts} 分`;
+  const watchInput = document.getElementById('specialWatchCalInput');
+  if (watchInput) watchInput.placeholder = `例如 ${sysCal}`;
+  const hint = document.getElementById('specialWatchHint');
+  if (hint) hint.innerHTML = buildSpecialWatchHintHtml(f, sysCal);
+  const warning = document.getElementById('specialCalWarning');
+  if (warning) warning.innerHTML = buildSpecialCalWarningHtml(f, sysCal);
+}
 function updateSpecialMinutes(v) {
   _specialForm.minutes = Math.max(1, parseInt(v) || 0);
   _specialForm.calWarningShown = false;
-  rerenderRecordModal();
+  refreshSpecialInlineSummary();
 }
 function updateWatchCal(v) {
   _specialForm.watchCal = v;
   _specialForm.calWarningShown = false;
-  rerenderRecordModal();
+  refreshSpecialInlineSummary();
 }
 function ignoreCalWarning() {
   _specialForm.calWarningShown = true;
-  rerenderRecordModal();
+  refreshSpecialInlineSummary();
 }
 function fixCalToSystem() {
   const sysCal = calcSportCalories(_specialForm.sport, _specialForm.minutes);
   _specialForm.watchCal = String(sysCal);
   _specialForm.calWarningShown = true;
-  rerenderRecordModal();
+  refreshSpecialInlineSummary();
 }
 function calcSportCalories(sport, minutes) {
   const calPerMin = SPECIAL_CAL_PER_MIN[sport] || 7;
@@ -8025,9 +8058,6 @@ function updateDietQty(n) {
   // 只更新扣分展示，不重渲染整个 modal（避免输入框失焦）
   const DEDUCT_PER_ITEM = 5;
   const totalDeduct = DEDUCT_PER_ITEM * v;
-  // 同步 input 元素的值（防止 NaN/0 输入）
-  const qtyInput = document.querySelector('#modalBody input[type="number"][min="1"][max="20"]');
-  if (qtyInput && qtyInput.value !== String(v)) qtyInput.value = v;
   const pointsInline = document.querySelector('#modalBody .points-inline .pi-value');
   if (pointsInline) pointsInline.textContent = `-${totalDeduct} 分`;
   const refTextEl = document.querySelector('#modalBody div[style*="text-align:center"][style*="font-size:12px"]');
