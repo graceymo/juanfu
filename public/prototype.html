@@ -2142,8 +2142,8 @@ function leaderboardInCircle(circle, myWeekPts) {
     // 头像：用户自己用当前 appState.emoji（保证换头像实时同步），其他成员用各自 emoji
     emoji: m.isMe ? (appState.emoji || m.emoji || '🐙') : (m.emoji || (m.name || '?')[0]),
     color: m.isMe ? 'green' : (m.isLeader ? 'gold' : ''),
-    // 统一从 getMemberWeekPts 派生：isMe → getMyWeekPts(含 streak)；其他成员 → memberRecentRecords 求和
-    // 这样 bio 页和排行榜显示同一个数字，不会漂移
+    // 统一从 getMemberWeekPts 派生：isMe → 本周记录和；其他成员 → memberList 实时 score（跨用户同步维护）
+    // 这样排行榜不会被演示缓存/历史快照污染
     pts: m.isMe ? myScore : getMemberWeekPts(m.name, m.score),
     isMe: !!m.isMe,
     isLeader: !!m.isLeader
@@ -2153,27 +2153,20 @@ function leaderboardInCircle(circle, myWeekPts) {
   return all;
 }
 
-// 本周积分 = 派生自 memberList[isMe].score（唯一数据源）+ streak bonus
+// 本周积分（排行榜口径）= 本周运动记录积分之和（不含 streak bonus）
+// 说明：streak bonus 是激励展示项，不参与圈子排行榜排序。
 function getMyWeekPts() {
-  // 个人积分与圈子无关：运动积分累加器 + 连续打卡阶段加成
-  // 切换圈子不影响个人积分，只有排行榜成员 / 社群帖子随圈子变化
-  return (appState.weeklyPoints || 0) + (appState.streakBonus || 0);
+  return getWeekPointsFromRecords();
 }
 
-// 统一成员本周积分计算（bio 页和排行榜用同一份逻辑，避免两边数字漂移）
-// 规则：
-// 1) 当前用户（isMe）：用 getMyWeekPts（含 streak bonus）
-// 2) 其他成员：如果有 memberRecentRecords，求和 pts（数据真源）
-//    没有 records 才用 memberList 中的静态 score（最后回退）
+// 统一成员本周积分计算（排行榜/圈子卡/Bio 统一口径）
+// 关键修复：不再读取 memberRecentRecords（那是演示数据，可能长期滞后导致错排）
+// 对他人分数只信任圈子 memberList 中的实时 score（由跨用户同步器维护）。
 function getMemberWeekPts(name, fallbackScore) {
   if (name === appState.nick) {
     return getMyWeekPts();
   }
-  const records = appState.memberRecentRecords && appState.memberRecentRecords[name];
-  if (records && records.length > 0) {
-    return records.reduce(function(s, r) { return s + (r.pts || 0); }, 0);
-  }
-  return fallbackScore || 0;
+  return Number(fallbackScore || 0);
 }
 
 // 当前用户在活跃圈子的本周排名
@@ -8230,6 +8223,128 @@ function stopCloudSync() {
   cloudSyncActiveNick = '';
 }
 
+function nickKey(name) {
+  return String(name || '').trim().toLowerCase();
+}
+
+function isSameNick(a, b) {
+  var ka = nickKey(a);
+  var kb = nickKey(b);
+  return !!ka && ka === kb;
+}
+
+function parseRecordTimestamp(rec) {
+  if (!rec) return NaN;
+  if (typeof rec.createdAt === 'number') return rec.createdAt;
+  if (typeof rec.createdAt === 'string') {
+    var n = Number(rec.createdAt);
+    if (!isNaN(n) && n > 0) return n;
+    var p = Date.parse(rec.createdAt);
+    if (!isNaN(p)) return p;
+  }
+  if (rec.date) return combineDateTime(rec.date, rec.time || '00:00');
+  return NaN;
+}
+
+function getWeekPointsFromState(st) {
+  if (!st) return 0;
+  var records = Array.isArray(st.todayRecords) ? st.todayRecords : [];
+  if (records.length === 0) return Number(st.weeklyPoints || 0);
+
+  var now = new Date();
+  var today0 = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  var dow = now.getDay() || 7;
+  var weekStart = today0 - (dow - 1) * 86400000;
+
+  return records.reduce(function(sum, r) {
+    var ts = parseRecordTimestamp(r);
+    if (isNaN(ts) || ts < weekStart) return sum;
+    return sum + Number(r && r.points || 0);
+  }, 0);
+}
+
+function buildMemberRecentRecordsFromState(st) {
+  var records = Array.isArray(st && st.todayRecords) ? st.todayRecords : [];
+  return records
+    .filter(function(r) { return r && (r.type === 'daily' || r.type === 'special'); })
+    .sort(function(a, b) { return parseRecordTimestamp(b) - parseRecordTimestamp(a); })
+    .slice(0, 3)
+    .map(function(r) {
+      var ts = parseRecordTimestamp(r);
+      var desc = r.type === 'daily'
+        ? ((r.group || '日常') + '·' + (r.exercise || '训练') + ' ' + (r.reps ? (r.reps + '×' + (r.sets || 1)) : ((r.sets || 0) + '分钟')))
+        : ((r.sport || '专项') + ' ' + (r.minutes || 0) + '分钟');
+      return {
+        emoji: r.type === 'daily' ? '🤸' : '🏃',
+        desc: desc,
+        time: isNaN(ts) ? '刚刚' : formatDateTime(ts),
+        pts: Number(r.points || 0)
+      };
+    });
+}
+
+function captureMyRanksForSync() {
+  var out = {};
+  if (!hasJoinedCircles()) return out;
+  var myPts = getWeekPointsFromRecords();
+  (appState.circles || []).forEach(function(c) {
+    if (!c || c.pending || !Array.isArray(c.memberList)) return;
+    out[c.id] = computeMyRankInCircle(c, myPts);
+  });
+  return out;
+}
+
+function emitRankChangeNotificationsAfterSync(prevRanks) {
+  if (!hasJoinedCircles()) return false;
+  if (!appState.lastCircleRanks) appState.lastCircleRanks = {};
+
+  var notified = false;
+  var myPts = getWeekPointsFromRecords();
+
+  (appState.circles || []).forEach(function(c) {
+    if (!c || c.pending || !Array.isArray(c.memberList)) return;
+
+    var newRank = computeMyRankInCircle(c, myPts);
+    var oldRank = prevRanks && prevRanks[c.id] != null ? prevRanks[c.id] : appState.lastCircleRanks[c.id];
+    appState.lastCircleRanks[c.id] = newRank;
+
+    if (oldRank == null || oldRank === newRank) return;
+
+    var all = leaderboardInCircle(c, myPts);
+    if (newRank < oldRank) {
+      var passed = all
+        .filter(function(u) { return u.rank > newRank && u.rank <= oldRank && !isSameNick(u.name, appState.nick); })
+        .map(function(u) { return u.name; });
+      if (passed.length > 0) {
+        pushNotification({
+          type: 'rank_up',
+          circleId: c.id,
+          title: '🎉 排名上升！',
+          body: '在「' + c.name + '」中你超过了 ' + passed.join('、') + '，当前第 ' + newRank + ' 名',
+          time: Date.now()
+        });
+        notified = true;
+      }
+    } else {
+      var overtakers = all
+        .filter(function(u) { return u.rank < newRank && u.rank >= oldRank && !isSameNick(u.name, appState.nick); })
+        .map(function(u) { return u.name; });
+      pushNotification({
+        type: 'rank_down',
+        circleId: c.id,
+        title: '📉 排名下降',
+        body: overtakers.length > 0
+          ? ('在「' + c.name + '」中' + overtakers.join('、') + '刚刚反超了你，当前第 ' + newRank + ' 名')
+          : ('在「' + c.name + '」中你被反超了，当前第 ' + newRank + ' 名'),
+        time: Date.now()
+      });
+      notified = true;
+    }
+  });
+
+  return notified;
+}
+
 function normalizeCircleMemberListForUser(circle, myNick, myEmoji, myRole) {
   if (!circle) return;
   const raw = Array.isArray(circle.memberList) ? circle.memberList : [];
@@ -8237,57 +8352,59 @@ function normalizeCircleMemberListForUser(circle, myNick, myEmoji, myRole) {
   const next = [];
 
   var leaderName = '';
-  const explicitLeader = raw.find(m => m && m.isLeader && m.name);
+  const explicitLeader = raw.find(function(m) { return m && m.isLeader && m.name; });
   if (explicitLeader) leaderName = explicitLeader.name;
   if (!leaderName && myRole === 'leader') leaderName = myNick;
 
   for (const m of raw) {
     if (!m || !m.name) continue;
-    if (seenNames.has(m.name)) continue;
-    seenNames.add(m.name);
+    var key = nickKey(m.name);
+    if (!key || seenNames.has(key)) continue;
+    seenNames.add(key);
     next.push({
       name: m.name,
-      emoji: m.emoji || (m.name === myNick ? (myEmoji || '👤') : '👤'),
+      emoji: m.emoji || (isSameNick(m.name, myNick) ? (myEmoji || '👤') : '👤'),
       score: Number(m.score || 0),
       joinDate: m.joinDate || getCurrentWeekKey(),
-      isMe: m.name === myNick,
+      isMe: isSameNick(m.name, myNick),
       isLeader: false
     });
   }
 
-  if (myNick && !seenNames.has(myNick)) {
+  var myKey = nickKey(myNick);
+  if (myNick && myKey && !seenNames.has(myKey)) {
     next.push({
       name: myNick,
       emoji: myEmoji || '👤',
-      score: Number(appState.weeklyPoints || 0),
+      score: Number(getWeekPointsFromRecords()),
       joinDate: getCurrentWeekKey(),
       isMe: true,
       isLeader: myRole === 'leader'
     });
-    seenNames.add(myNick);
+    seenNames.add(myKey);
   }
 
   if (!leaderName) {
-    const fallbackLeader = next.find(m => m.name !== myNick) || next[0];
+    const fallbackLeader = next.find(function(m) { return !isSameNick(m.name, myNick); }) || next[0];
     leaderName = fallbackLeader ? fallbackLeader.name : myNick;
   }
 
-  next.forEach(m => {
-    m.isMe = m.name === myNick;
-    m.isLeader = m.name === leaderName;
+  next.forEach(function(m) {
+    m.isMe = isSameNick(m.name, myNick);
+    m.isLeader = isSameNick(m.name, leaderName);
   });
 
   if (myRole === 'leader') {
-    next.forEach(m => {
-      if (m.name === myNick) m.isLeader = true;
+    next.forEach(function(m) {
+      if (isSameNick(m.name, myNick)) m.isLeader = true;
       else if (m.isLeader) m.isLeader = false;
     });
   } else {
-    next.forEach(m => {
-      if (m.name === myNick) m.isLeader = false;
+    next.forEach(function(m) {
+      if (isSameNick(m.name, myNick)) m.isLeader = false;
     });
-    if (!next.some(m => m.isLeader) && next.length > 0) {
-      const fallback = next.find(m => m.name !== myNick) || next[0];
+    if (!next.some(function(m) { return m.isLeader; }) && next.length > 0) {
+      const fallback = next.find(function(m) { return !isSameNick(m.name, myNick); }) || next[0];
       fallback.isLeader = true;
     }
   }
@@ -8351,9 +8468,19 @@ function reconcileCrossUserCirclesFromCloudDirectory(allUsers) {
 
   let changed = false;
   const byNick = {};
+  const byNickLower = {};
   allUsers.forEach(u => {
-    if (u && u.nick && u.app_state) byNick[u.nick] = u.app_state;
+    if (u && u.nick && u.app_state) {
+      byNick[u.nick] = u.app_state;
+      byNickLower[nickKey(u.nick)] = u.app_state;
+    }
   });
+
+  function getStateByName(name) {
+    return byNick[name] || byNickLower[nickKey(name)] || null;
+  }
+
+  var myNickLower = nickKey(appState.nick);
 
   const nextCircles = [];
   const kickedCircles = [];
@@ -8384,8 +8511,8 @@ function reconcileCrossUserCirclesFromCloudDirectory(allUsers) {
       continue;
     }
 
-    const memberNames = new Set((leaderCircle.memberList || []).map(m => m && m.name).filter(Boolean));
-    if (!memberNames.has(appState.nick)) {
+    const memberNames = new Set((leaderCircle.memberList || []).map(function(m) { return nickKey(m && m.name); }).filter(Boolean));
+    if (!memberNames.has(myNickLower)) {
       changed = true;
       kickedCircles.push({ id: localCircle.id, name: localCircle.name || leaderCircle.name || '圈子' });
       continue;
@@ -8410,26 +8537,47 @@ function reconcileCrossUserCirclesFromCloudDirectory(allUsers) {
     const beforeMembers = JSON.stringify(c.memberList);
 
     for (const m of c.memberList) {
-      if (!m || m.name === appState.nick || m.isLeader) continue;
-      const memberSt = byNick[m.name];
+      if (!m || isSameNick(m.name, appState.nick) || m.isLeader) continue;
+
+      const memberSt = getStateByName(m.name);
       if (!memberSt || !Array.isArray(memberSt.circles)) continue;
 
-      const memberCircle = memberSt.circles.find(mc =>
-        mc && !mc.pending && ((mc.id && mc.id === c.id) || (mc.code && mc.code === c.code))
-      );
-      if (!memberCircle || !Array.isArray(memberCircle.memberList)) continue;
+      const memberCircle = memberSt.circles.find(function(mc) {
+        if (!mc || mc.pending) return false;
+        if ((mc.id && mc.id === c.id) || (mc.code && c.code && mc.code === c.code)) return true;
 
-      const memberSelf = memberCircle.memberList.find(x => x && (x.isMe || x.name === m.name));
-      if (!memberSelf) continue;
+        // 容错：历史脏数据可能出现 id 漂移，回退到"同名圈子 + 彼此都在成员列表"判断
+        const names = (mc.memberList || []).map(function(x) { return nickKey(x && x.name); }).filter(Boolean);
+        return !!(mc.name && c.name && mc.name === c.name && names.includes(myNickLower) && names.includes(nickKey(m.name)));
+      });
+      if (!memberCircle) continue;
 
-      const remoteScore = Number(memberSelf.score || 0);
+      const memberSelf = (memberCircle.memberList || []).find(function(x) {
+        return x && (x.isMe || isSameNick(x.name, m.name));
+      });
+
+      // 关键修复：成员分数以该成员自己的 todayRecords 周累计为准，杜绝旧 weeklyPoints/memberList 快照污染
+      const remoteScore = Number(getWeekPointsFromState(memberSt));
       if (remoteScore !== Number(m.score || 0)) {
         m.score = remoteScore;
         changed = true;
       }
-      if (memberSelf.emoji && memberSelf.emoji !== m.emoji) {
-        m.emoji = memberSelf.emoji;
+
+      const remoteEmoji = (memberSt.emoji || (memberSelf && memberSelf.emoji) || m.emoji);
+      if (remoteEmoji && remoteEmoji !== m.emoji) {
+        m.emoji = remoteEmoji;
         changed = true;
+      }
+
+      // 把成员近期记录同步到本地缓存（Bio 页展示）
+      if (!appState.memberRecentRecords) appState.memberRecentRecords = {};
+      const remoteRecent = buildMemberRecentRecordsFromState(memberSt);
+      if (remoteRecent.length > 0) {
+        const oldRecent = appState.memberRecentRecords[m.name] || [];
+        if (JSON.stringify(oldRecent) !== JSON.stringify(remoteRecent)) {
+          appState.memberRecentRecords[m.name] = remoteRecent;
+          changed = true;
+        }
       }
     }
 
@@ -8474,6 +8622,7 @@ function startCloudSync() {
     }
 
     var hadPendingBefore = (appState.circles || []).some(function(c) { return c.pending; });
+    var prevRanks = captureMyRanksForSync();
     var localUpdated = appState.updated_at || '';
 
     if (typeof sb === 'undefined' || !sb) {
@@ -8509,6 +8658,10 @@ function startCloudSync() {
 
       if (changed) {
         appState.nick = cloudSyncActiveNick;
+
+        // 云端轮询导致的排名变化通知（别人打卡引起你升/降名次）
+        emitRankChangeNotificationsAfterSync(prevRanks);
+
         appState.updated_at = new Date().toISOString();
         saveAppState();
         refreshViewsAfterCloudSync();
