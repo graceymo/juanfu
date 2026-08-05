@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>卷腹 · 首次注册</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background: #000;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    height: 100vh; height: 100dvh;
+  }
+  .loader {
+    text-align: center;
+  }
+  .loader .emoji { font-size: 48px; margin-bottom: 16px; }
+  .loader .text { font-size: 16px; color: #8E8E93; }
+</style>
+</head>
+<body>
+<div class="loader">
+  <div class="emoji">🆕</div>
+  <div class="text">准备新用户注册体验…</div>
+</div>
+<script>
+  // 清除任何已有登录态，确保从注册页开始
+  try { localStorage.removeItem('juanfu_user'); } catch(e) {}
+  // 跳转到主原型页面
+  window.location.replace('prototype.html');
+</script>
+</body>
+</html>

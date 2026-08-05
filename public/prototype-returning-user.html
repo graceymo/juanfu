@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>卷腹 · Gracey 已登录</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background: #000;
+    color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    height: 100vh; height: 100dvh;
+  }
+  .loader {
+    text-align: center;
+  }
+  .loader .emoji { font-size: 48px; margin-bottom: 16px; animation: pulse 0.6s ease-in-out infinite alternate; }
+  @keyframes pulse { from { transform: scale(1); } to { transform: scale(1.1); } }
+  .loader .text { font-size: 16px; color: #8E8E93; }
+</style>
+</head>
+<body>
+<div class="loader">
+  <div class="emoji">🐙</div>
+  <div class="text">欢迎回来，Gracey…</div>
+</div>
+<script>
+  // ======== 模拟用户数据 ========
+  // Gracey — 运动户外行业运营，已加入 2 个圈子
+  var userData = {
+    onboardingDone: true,
+    nick: 'Gracey',
+    emoji: '🐙',
+    height: 168,
+    weight: 55,
+    bodyFat: 22,
+    slogan: '不卷不是人',
+    freq: 'daily',
+    privacy: true,
+    schedulePublic: true,
+    notifSettings: { workout: true, diet: false, overtake: true, invite: true },
+    hasCircle: true,
+    myInviteCode: 'NW7R5DWY',
+    circles: [
+      {
+        id: 'preset-1',
+        name: '原来你也是公主',
+        icon: '👑',
+        emoji: '👑',
+        members: 2,
+        role: 'leader',
+        score: 210,
+        ownerName: 'Gracey',
+        code: 'NW7R5DWY',
+        tags: ['运动', '打卡'],
+        recentActivity: ['🏃 Gracey 跑了 8km，+32 分', '🥗 Monk 打卡健康午餐', '👑 本周 Gracey 暂列第1'],
+        memberList: [
+          { name: 'Gracey', emoji: '🐙', score: 94, isMe: true, isLeader: true },
+          { name: 'Monk', emoji: '🧙', score: 72, isMe: false, isLeader: false }
+        ],
+        joinRequests: []
+      },
+      {
+        id: 'preset-2',
+        name: 'K800 运动户外',
+        icon: '🏔️',
+        emoji: '🏔️',
+        members: 28,
+        role: 'member',
+        score: 320,
+        ownerName: 'TigerBai',
+        code: 'K800OPEN',
+        tags: ['官方', 'K800'],
+        recentActivity: ['🔥 迪卡侬达成月 GMV 500w', '🎯 安踏好友日 7.22-7.26'],
+        memberList: [
+          { name: 'Gracey', emoji: '🐙', score: 88, isMe: true, isLeader: false },
+          { name: 'TigerBai', emoji: '🐯', score: 120, isMe: false, isLeader: true },
+          { name: 'Monk', emoji: '🧙', score: 95, isMe: false, isLeader: false },
+          { name: 'Kenny', emoji: '🦊', score: 78, isMe: false, isLeader: false }
+        ],
+        joinRequests: []
+      }
+    ],
+    activeCircleId: 'preset-1'
+  };
+
+  try {
+    localStorage.setItem('juanfu_user', JSON.stringify(userData));
+  } catch(e) {}
+
+  window.location.replace('prototype.html');
+</script>
+</body>
+</html>
