@@ -2111,8 +2111,95 @@ const appState = {
       { emoji: '🧘', desc: '太极 30 分钟', time: '昨天 06:00', pts: 10 },
       { emoji: '🏸', desc: '羽毛球休闲 1 小时', time: '7/20', pts: 15 }
     ]
-  }
+  },
+
+  // 社群动态（按圈子存储，支持跨用户云同步）
+  // 结构：{ [circleId]: [post, ...] }
+  communityPostsByCircle: {}
 };
+
+function parsePostTimestamp(post) {
+  if (!post) return 0;
+  if (post.createdAt) {
+    const ts = Date.parse(post.createdAt);
+    if (!isNaN(ts)) return ts;
+  }
+  if (post.time && typeof post.time === 'number') return post.time;
+  return 0;
+}
+
+function normalizeCommunityPostLite(post, fallbackCircleId) {
+  if (!post || typeof post !== 'object') return null;
+  const id = post.id || ('post-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
+  const circleId = post.circleId || fallbackCircleId || appState.activeCircleId || null;
+  const circleIds = Array.isArray(post.circleIds) && post.circleIds.length > 0
+    ? post.circleIds.filter(Boolean)
+    : (circleId ? [circleId] : []);
+  return {
+    id,
+    circleId,
+    circleIds,
+    name: post.name || '',
+    emoji: post.emoji || '👤',
+    content: post.content || '',
+    image: post.image || null,
+    imageUrl: post.imageUrl || (isPostImageSrc(post.image) ? post.image : null),
+    imageLabel: post.imageLabel || (isPostImageSrc(post.image) ? '动态图片' : (post.image || null)),
+    createdAt: post.createdAt || new Date().toISOString(),
+    time: post.time || '刚刚',
+    likes: Number(post.likes || 0),
+    liked: !!post.liked,
+    commentsList: Array.isArray(post.commentsList) ? post.commentsList : []
+  };
+}
+
+function ensureCommunityPostsStore() {
+  if (!appState.communityPostsByCircle || typeof appState.communityPostsByCircle !== 'object') {
+    appState.communityPostsByCircle = {};
+  }
+  if (window._userPostsByCircle && window._userPostsByCircle !== appState.communityPostsByCircle) {
+    Object.keys(window._userPostsByCircle).forEach(function(cid) {
+      if (!Array.isArray(window._userPostsByCircle[cid])) return;
+      if (!Array.isArray(appState.communityPostsByCircle[cid])) appState.communityPostsByCircle[cid] = [];
+      appState.communityPostsByCircle[cid] = appState.communityPostsByCircle[cid].concat(window._userPostsByCircle[cid]);
+    });
+  }
+  window._userPostsByCircle = appState.communityPostsByCircle;
+  return appState.communityPostsByCircle;
+}
+
+function upsertCommunityPostInStore(post, circleId) {
+  if (!post) return;
+  const store = ensureCommunityPostsStore();
+  if (!circleId) return;
+  if (!Array.isArray(store[circleId])) store[circleId] = [];
+  const normalized = normalizeCommunityPostLite(post, circleId);
+  if (!normalized) return;
+  const list = store[circleId];
+  const idx = list.findIndex(function(p) { return p && p.id === normalized.id; });
+  if (idx >= 0) list[idx] = normalized;
+  else list.unshift(normalized);
+  list.sort(function(a, b) { return parsePostTimestamp(b) - parsePostTimestamp(a); });
+  if (list.length > 100) store[circleId] = list.slice(0, 100);
+}
+
+function getMemberRecentRecordsByName(memberName) {
+  if (!memberName || !appState.memberRecentRecords) return [];
+  if (Array.isArray(appState.memberRecentRecords[memberName])) {
+    return appState.memberRecentRecords[memberName];
+  }
+  var mk = nickKey(memberName);
+  var keys = Object.keys(appState.memberRecentRecords);
+  for (var i = 0; i < keys.length; i++) {
+    var k = keys[i];
+    if (nickKey(k) === mk && Array.isArray(appState.memberRecentRecords[k])) {
+      return appState.memberRecentRecords[k];
+    }
+  }
+  return [];
+}
+
+ensureCommunityPostsStore();
 
 // ======================== 周/季度管理 ========================
 function getCurrentWeekKey() {
@@ -2242,7 +2329,7 @@ function getMyWeekPts() {
 // 关键修复：不再读取 memberRecentRecords（那是演示数据，可能长期滞后导致错排）
 // 对他人分数只信任圈子 memberList 中的实时 score（由跨用户同步器维护）。
 function getMemberWeekPts(name, fallbackScore) {
-  if (name === appState.nick) {
+  if (isSameNick(name, appState.nick)) {
     return getMyWeekPts();
   }
   return Number(fallbackScore || 0);
@@ -5272,8 +5359,17 @@ function finalizeSubmit(record) {
 
   // 如果分享了，也加到社群动态（按当前 circleId 隔离存储）
   if (record.shared) {
-    const circleId = appState.activeCircleId;
-    const circleIds = [circleId];
+    const activeCircle = appState.circles.find(c => c.id === appState.activeCircleId) || appState.circles[0];
+    const circleId = activeCircle ? activeCircle.id : null;
+    const circleIds = circleId ? [circleId] : [];
+    if (circleIds.length === 0) {
+      showToast('请先加入圈子后再同步到社群');
+      closeModal();
+      saveAppState();
+      refreshDashboard();
+      refreshRecordPage();
+      return;
+    }
     const imageSrc = record.photoData?.url || record.photoData?.localPath || null;
     const imageLabel = record.photoData?.fileName || record.photoData?.label || (record.exercise || record.sport) || '训练照片';
     const newPost = {
@@ -5295,62 +5391,56 @@ function finalizeSubmit(record) {
       likes: 0,
       commentsList: []
     };
-    if (!window._userPostsByCircle) window._userPostsByCircle = {};
-    if (!window._userPostsByCircle[circleId]) window._userPostsByCircle[circleId] = [];
-    window._userPostsByCircle[circleId].unshift(newPost);
+    upsertCommunityPostInStore(newPost, circleId);
 
-    const sharedEnabled = !!window._sharedFeed?.enabled;
-    if (sharedEnabled) {
-      fetch('/api/shared/posts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          authorName: appState.nick,
-          authorEmoji: appState.emoji,
-          content: newPost.content,
-          image: newPost.imageUrl || newPost.image || null,
-          circleIds,
-          circleId
-        })
-      }).then(resp => {
-        if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        return resp.json();
-      }).then(data => {
-        const sp = data?.post;
-        if (!sp) return;
-        const serverPost = {
-          id: sp.id,
-          circleId: sp.circleId || circleId,
-          circleIds: Array.isArray(sp.circleIds) && sp.circleIds.length > 0 ? sp.circleIds : [circleId],
-          name: sp.name || appState.nick,
-          emoji: sp.emoji || appState.emoji,
-          content: sp.content || newPost.content,
-          image: sp.image || null,
-          imageUrl: isPostImageSrc(sp.image) ? sp.image : null,
-          imageLabel: isPostImageSrc(sp.image) ? imageLabel : (sp.image || imageLabel),
-          createdAt: sp.createdAt || newPost.createdAt,
-          time: formatAgo(sp.createdAt ? new Date(sp.createdAt).getTime() : Date.now()),
-          likes: sp.likes || 0,
-          liked: !!sp.liked,
-          commentsList: sp.commentsList || []
-        };
-        const list = window._userPostsByCircle[circleId] || [];
-        const idx = list.findIndex(p => p.id === newPost.id);
-        if (idx >= 0) list[idx] = serverPost;
-        else list.unshift(serverPost);
-        renderCommunityFeed();
-      }).catch((err) => {
-        const msg = String(err && err.message || '');
-        if (msg.includes('413')) {
-          showToast('图片仍偏大，云端未同步；请换更小图片重试');
-        } else {
-          showToast('已本地发布，云端同步稍后重试');
-        }
+    // 始终尝试写入 shared feed：避免“从运动记录分享时 sharedMode 未启用”导致跨端不可见。
+    fetch('/api/shared/posts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        authorName: appState.nick,
+        authorEmoji: appState.emoji,
+        content: newPost.content,
+        image: newPost.imageUrl || newPost.image || null,
+        circleIds,
+        circleId
+      })
+    }).then(resp => {
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      return resp.json();
+    }).then(data => {
+      const sp = data?.post;
+      if (!sp) return;
+      const serverPost = {
+        id: sp.id,
+        circleId: sp.circleId || circleId,
+        circleIds: Array.isArray(sp.circleIds) && sp.circleIds.length > 0 ? sp.circleIds : [circleId],
+        name: sp.name || appState.nick,
+        emoji: sp.emoji || appState.emoji,
+        content: sp.content || newPost.content,
+        image: sp.image || null,
+        imageUrl: isPostImageSrc(sp.image) ? sp.image : null,
+        imageLabel: isPostImageSrc(sp.image) ? imageLabel : (sp.image || imageLabel),
+        createdAt: sp.createdAt || newPost.createdAt,
+        time: formatAgo(sp.createdAt ? new Date(sp.createdAt).getTime() : Date.now()),
+        likes: sp.likes || 0,
+        liked: !!sp.liked,
+        commentsList: sp.commentsList || []
+      };
+      (serverPost.circleIds || [circleId]).forEach(function(cid) {
+        upsertCommunityPostInStore(serverPost, cid);
       });
-    } else {
-      // 仅本地模式下触发互动模拟（共享模式避免假互动干扰）
-      triggerSocialSimulator(newPost.id);
-    }
+      saveAppState();
+      renderCommunityFeed();
+    }).catch((err) => {
+      const msg = String(err && err.message || '');
+      if (msg.includes('413')) {
+        showToast('图片仍偏大，云端未同步；请换更小图片重试');
+      } else {
+        // 保留本地帖子，不再因 shared 拉取覆盖而丢失。
+        showToast('已本地发布，云端同步稍后重试');
+      }
+    });
   }
 
   closeModal();
@@ -5959,6 +6049,7 @@ function renderPostImageHtml(post) {
 function renderCommunityFeed() {
   const dynamicEl = document.getElementById('communityFeedDynamic');
   const mockEl = document.getElementById('communityFeedMock');
+  ensureCommunityPostsStore();
   if (!dynamicEl || !mockEl) return;
 
   const active = appState.circles.find(c => c.id === appState.activeCircleId) || appState.circles[0];
@@ -5984,12 +6075,18 @@ function renderCommunityFeed() {
   const userPosts = allUserPosts[active.id] || [];
   dynamicEl.innerHTML = userPosts.map(p => renderPostHtml(p)).join('');
 
-  // 2) mock 帖子：按当前 active circle 的 memberList + circleId 过滤
-  const memberNames = new Set((active.memberList || []).map(m => m.name));
-  const filtered = MOCK_POSTS.filter(p => p.circleId === active.id && memberNames.has(p.name));
-  mockEl.innerHTML = filtered.map(p => renderPostHtml(p)).join('');
+  // 2) mock 帖子默认关闭（避免出现“系统代替真实用户互动”的假象）
+  const enableMockSocial = (new URL(location.href)).searchParams.get('mockSocial') === '1';
+  let filtered = [];
+  if (enableMockSocial) {
+    const memberNames = new Set((active.memberList || []).map(m => m.name));
+    filtered = MOCK_POSTS.filter(p => p.circleId === active.id && memberNames.has(p.name));
+    mockEl.innerHTML = filtered.map(p => renderPostHtml(p)).join('');
+  } else {
+    mockEl.innerHTML = '';
+  }
 
-  // 3) 更新顶部副标题：所选圈子名 + 当前圈子的动态数（用户帖 + mock 帖）
+  // 3) 更新顶部副标题：所选圈子名 + 当前圈子的动态数
   const sub = document.getElementById('communitySubtitle');
   if (sub) {
     const total = userPosts.length + filtered.length;
@@ -6096,8 +6193,12 @@ function renderPostHtml(p) {
 
 // 在内存里找到帖子（同时搜索 MOCK_POSTS 和 _userPostsByCircle）
 function _findPostAnywhere(postId) {
-  const m = MOCK_POSTS.find(p => p.id === postId);
-  if (m) return m;
+  ensureCommunityPostsStore();
+  const enableMockSocial = (new URL(location.href)).searchParams.get('mockSocial') === '1';
+  if (enableMockSocial) {
+    const m = MOCK_POSTS.find(p => p.id === postId);
+    if (m) return m;
+  }
   if (window._userPostsByCircle) {
     for (const circleId in window._userPostsByCircle) {
       const arr = window._userPostsByCircle[circleId];
@@ -6126,6 +6227,7 @@ function togglePostLike(postId) {
     p.liked = true;
     p.likes = (p.likes || 0) + 1;
   }
+  saveAppState();
   renderCommunityFeed();
 }
 
@@ -6160,6 +6262,7 @@ function submitPostComment(postId) {
     replies: []
   });
   inp.value = '';
+  saveAppState();
   renderCommunityFeed();
   // 重聚焦
   setTimeout(() => {
@@ -6181,6 +6284,7 @@ function toggleCommentLike(postId, commentId) {
     c.liked = true;
     c.likes = (c.likes || 0) + 1;
   }
+  saveAppState();
   renderCommunityFeed();
 }
 
@@ -6219,6 +6323,7 @@ function submitPostReply(postId, commentId) {
     time: '刚刚'
   });
   window._openReply = null;
+  saveAppState();
   renderCommunityFeed();
 }
 
@@ -6464,9 +6569,15 @@ function submitPost() {
 
   // 获取选中的圈子 ids（支持多选）
   const sel = window._postEditor?.selectedCircleIds;
-  const circleIds = (sel && sel.size > 0) ? Array.from(sel) : [appState.activeCircleId];
+  const activeCircle = appState.circles.find(c => c.id === appState.activeCircleId) || appState.circles[0];
+  const selectedIds = (sel && sel.size > 0) ? Array.from(sel) : [activeCircle ? activeCircle.id : null];
+  const circleIds = selectedIds.filter(Boolean);
+  if (circleIds.length === 0) {
+    showToast('请先加入圈子后再发帖');
+    return;
+  }
   const primaryCircleId = circleIds[0];
-  const primaryCircle = appState.circles.find(c => c.id === primaryCircleId);
+  const primaryCircle = appState.circles.find(c => c.id === primaryCircleId) || activeCircle;
 
   const selectedImage = getSelectedPostImagePayload();
   const newPost = {
@@ -6484,16 +6595,15 @@ function submitPost() {
     likes: 0,
     commentsList: []
   };
-  if (!window._userPostsByCircle) window._userPostsByCircle = {};
   // 存入所有选中的圈子（共享同一 post 对象引用，点赞/评论自动跨圈同步）
   for (const cid of circleIds) {
-    if (!window._userPostsByCircle[cid]) window._userPostsByCircle[cid] = [];
-    window._userPostsByCircle[cid].unshift(newPost);
+    upsertCommunityPostInStore(newPost, cid);
   }
   // 清掉编辑器暂存状态
   safeRevokeObjectURL(window._postEditor?.image?.localPath);
   window._postEditor = { text: '', image: null, selectedCircleIds: null };
   closeModal();
+  saveAppState();
   renderCommunityFeed();
   // toast 文案
   if (circleIds.length === 1) {
@@ -6501,8 +6611,6 @@ function submitPost() {
   } else {
     showToast('✅ 已发布到 ' + circleIds.length + ' 个圈子');
   }
-  // 触发互动模拟
-  triggerSocialSimulator(newPost.id);
 }
 
 // ======================== 社群互动模拟（延迟评论 + 点赞）=======================
@@ -6561,87 +6669,9 @@ function _shortPostLabel(post) {
 }
 
 function triggerSocialSimulator(postId) {
-  const p = _findPostAnywhere(postId);
-  if (!p) return;
-  // 修复 P0：从当前圈子成员里随机抽 3 个互动者（排除自己）
-  // 之前硬编码 Monk/Lulu/Kenny，导致加入任意圈子都会看到这 3 人
-  const peers = _pickCirclePeer(p, 3);
-  if (peers.length === 0) return;  // 单人圈子无互动
-  const like1 = peers[0];
-  const like2 = peers.length > 1 ? peers[1] : null;
-  const commenter = peers.length > 2 ? peers[2] : (peers.length > 1 ? peers[1] : peers[0]);
-  const label = _shortPostLabel(p);
-  // 通知圈子名：多圈子帖子用主圈名，单圈子直接用该圈名
-  const cids = (p.circleIds && p.circleIds.length > 0) ? p.circleIds : [p.circleId];
-  const primaryCircleObj = (appState.circles || []).find(x => x.id === (p.circleId || (cids[0])));
-  const circleName = primaryCircleObj ? primaryCircleObj.name : '圈子';
-  const circleHint = (cids.length > 1) ? circleName + '等' + cids.length + '个圈子' : circleName;
-
-  // 1.5~3.5 秒后 like1 点赞
-  setTimeout(() => {
-    const p2 = _findPostAnywhere(postId);
-    if (!p2) return;
-    p2.likes = (p2.likes || 0) + 1;
-    if (_markSocialNotifSent(postId, 'like', like1.name)) {
-      pushNotification({
-        type: 'like',
-        title: '❤️ ' + like1.name + ' 赞了你的动态',
-        body: '在「' + circleHint + '」中点了赞',
-        postId,
-        fromName: like1.name,
-        fromEmoji: like1.emoji || '👋'
-      });
-    }
-    renderCommunityFeed();
-    showToast('❤️ ' + like1.name + ' 赞了你的动态');
-  }, 1500 + Math.random() * 2000);
-
-  // 3~5 秒后 like2 点赞
-  if (like2) {
-    setTimeout(() => {
-      const p2 = _findPostAnywhere(postId);
-      if (!p2) return;
-      p2.likes = (p2.likes || 0) + 1;
-      if (_markSocialNotifSent(postId, 'like', like2.name)) {
-        pushNotification({
-          type: 'like',
-          title: '❤️ ' + like2.name + ' 赞了你的动态',
-          body: '在「' + circleHint + '」中点了赞',
-          postId,
-          fromName: like2.name,
-          fromEmoji: like2.emoji || '👋'
-        });
-      }
-      renderCommunityFeed();
-      showToast('❤️ ' + like2.name + ' 赞了你的动态');
-    }, 3000 + Math.random() * 2000);
-  }
-
-  // 4~6 秒后 commenter 评论（如果 commenter === like1 或 like2，逻辑上仍合理：同一个人会点赞也会评论）
-  setTimeout(() => {
-    const p2 = _findPostAnywhere(postId);
-    if (!p2) return;
-    if (!p2.commentsList) p2.commentsList = [];
-    const cmt = kennyCommentsPool[Math.floor(Math.random() * kennyCommentsPool.length)];
-    p2.commentsList.push({
-      name: commenter.name,
-      emoji: commenter.emoji || '👋',
-      content: cmt,
-      time: '刚刚'
-    });
-    if (_markSocialNotifSent(postId, 'comment', commenter.name)) {
-      pushNotification({
-        type: 'comment',
-        title: '💬 ' + commenter.name + ' 评论了你',
-        body: '在「' + circleHint + '」中：' + cmt,
-        postId,
-        fromName: commenter.name,
-        fromEmoji: commenter.emoji || '👋'
-      });
-    }
-    renderCommunityFeed();
-    showToast('💬 ' + commenter.name + ' 评论了你的动态：' + cmt);
-  }, 4000 + Math.random() * 2000);
+  // 2026-08-05: 关闭系统自动互动，社群只允许真实用户行为触发。
+  // 保留函数壳以兼容历史调用点（若仍有旧入口调用，不做任何动作）。
+  return;
 }
 
 // ======================== 通知系统（社群互动）=======================
@@ -8665,6 +8695,7 @@ function normalizeAllCirclesState() {
 }
 
 function refreshViewsAfterCloudSync() {
+  ensureCommunityPostsStore();
   updateAllAvatars();
   updateCircleCard(hasJoinedCircles());
   renderSidebarCircles();
@@ -8742,6 +8773,84 @@ function reconcileCrossUserCirclesFromCloudDirectory(allUsers) {
   }
 
   appState.circles = nextCircles;
+
+  // 所有角色：拉齐成员近期运动（Bio 页）
+  if (!appState.memberRecentRecords || typeof appState.memberRecentRecords !== 'object') {
+    appState.memberRecentRecords = {};
+  }
+  var visibleMemberNameMap = {};
+  (appState.circles || []).forEach(function(c) {
+    if (!c || c.pending || !Array.isArray(c.memberList)) return;
+    c.memberList.forEach(function(m) {
+      if (!m || !m.name || isSameNick(m.name, appState.nick)) return;
+      visibleMemberNameMap[nickKey(m.name)] = m.name;
+      var memberSt = getStateByName(m.name);
+      var remoteRecent = memberSt ? buildMemberRecentRecordsFromState(memberSt) : [];
+      var oldRecent = getMemberRecentRecordsByName(m.name);
+      if (JSON.stringify(oldRecent || []) !== JSON.stringify(remoteRecent || [])) {
+        appState.memberRecentRecords[m.name] = remoteRecent;
+        changed = true;
+      }
+    });
+  });
+  Object.keys(appState.memberRecentRecords).forEach(function(name) {
+    if (!name) return;
+    var nk = nickKey(name);
+    if (nk && !visibleMemberNameMap[nk] && !isSameNick(name, appState.nick)) {
+      delete appState.memberRecentRecords[name];
+      changed = true;
+    }
+  });
+
+  // 所有角色：汇聚圈子动态（无需共享后端，依赖 Supabase app_state）
+  if (!appState.communityPostsByCircle || typeof appState.communityPostsByCircle !== 'object') {
+    appState.communityPostsByCircle = {};
+  }
+  var mergedPostsByCircle = {};
+  (appState.circles || []).forEach(function(c) {
+    if (!c || c.pending || !c.id) return;
+    var cid = c.id;
+    var byId = {};
+    var memberSet = new Set((c.memberList || []).map(function(m) {
+      return nickKey(m && m.name);
+    }).filter(Boolean));
+
+    function ingestPost(post) {
+      var normalized = normalizeCommunityPostLite(post, cid);
+      if (!normalized || !normalized.id) return;
+      var prev = byId[normalized.id];
+      if (!prev || parsePostTimestamp(normalized) >= parsePostTimestamp(prev)) {
+        byId[normalized.id] = normalized;
+      }
+    }
+
+    (appState.communityPostsByCircle[cid] || []).forEach(ingestPost);
+
+    allUsers.forEach(function(u) {
+      if (!u) return;
+      var st = u.app_state;
+      var userNick = u.nick || (st && st.nick) || '';
+      if (!st || !memberSet.has(nickKey(userNick))) return;
+      var sourceMap = st.communityPostsByCircle;
+      if (!sourceMap || typeof sourceMap !== 'object') return;
+      var posts = Array.isArray(sourceMap[cid]) ? sourceMap[cid] : [];
+      posts.forEach(ingestPost);
+    });
+
+    mergedPostsByCircle[cid] = Object.values(byId)
+      .sort(function(a, b) { return parsePostTimestamp(b) - parsePostTimestamp(a); })
+      .slice(0, 100);
+
+    var oldJson = JSON.stringify(appState.communityPostsByCircle[cid] || []);
+    var nextJson = JSON.stringify(mergedPostsByCircle[cid]);
+    if (oldJson !== nextJson) changed = true;
+  });
+
+  if (JSON.stringify(appState.communityPostsByCircle || {}) !== JSON.stringify(mergedPostsByCircle || {})) {
+    appState.communityPostsByCircle = mergedPostsByCircle;
+    ensureCommunityPostsStore();
+    changed = true;
+  }
 
   // Leader 侧：从成员云端数据回灌积分/头像，保证跨设备排行榜同步
   for (const c of (appState.circles || [])) {
@@ -8856,6 +8965,10 @@ function startCloudSync() {
       if (cloud && cloud.onboardingDone && cloud.updated_at && (!localUpdated || cloud.updated_at > localUpdated)) {
         Object.assign(appState, cloud);
         appState.nick = cloudSyncActiveNick;
+        if (!appState.communityPostsByCircle || typeof appState.communityPostsByCircle !== 'object') {
+          appState.communityPostsByCircle = {};
+        }
+        ensureCommunityPostsStore();
         changed = true;
       }
 
@@ -8913,6 +9026,7 @@ function startCloudSync() {
 function saveAppState() {
   try {
     normalizeAllCirclesState();
+    ensureCommunityPostsStore();
     const data = {
       onboardingDone: appState.onboardingDone,
       hasCircle: appState.hasCircle,
@@ -8941,6 +9055,7 @@ function saveAppState() {
       rankAtLastEvent: appState.rankAtLastEvent,
       notifications: appState.notifications,
       memberRecentRecords: appState.memberRecentRecords,
+      communityPostsByCircle: appState.communityPostsByCircle,
       leaderboardCache: appState.leaderboardCache
     };
     // 本地缓存（同步、即时响应）
@@ -9006,6 +9121,10 @@ async function loginFromCloud(nick) {
   Object.assign(appState, cloudData);
   // 🔧 修复：强制绑定当前登录 nick，避免读取到其他用户昵称
   appState.nick = nick;
+  if (!appState.communityPostsByCircle || typeof appState.communityPostsByCircle !== 'object') {
+    appState.communityPostsByCircle = {};
+  }
+  ensureCommunityPostsStore();
   normalizeAllCirclesState();
   // 写本地缓存
   try { localStorage.setItem(LS_KEY, JSON.stringify(appState)); } catch(e) {}
@@ -9065,6 +9184,10 @@ function loadAppState() {
     if (!appState.lastCircleRanks) appState.lastCircleRanks = {};
     if (!appState.rankAtLastEvent) appState.rankAtLastEvent = {};
     if (!appState.leaderboardCache) appState.leaderboardCache = {};
+    if (!appState.communityPostsByCircle || typeof appState.communityPostsByCircle !== 'object') {
+      appState.communityPostsByCircle = {};
+    }
+    ensureCommunityPostsStore();
     // 数据迁移：旧版本 appState.quarterPoints 语义是"上周积分"（finalizeSubmit 会写 = weeklyPoints + streakBonus）
     // → 新版 quarterPoints 是"本季度累加器"，需要清零避免误显示
     // 启发式：若 quarterPoints 与 weeklyPoints 几乎相等（差值 < 20），则视为旧的"周积分别名"并清零
@@ -9605,18 +9728,25 @@ function bioBody(params) {
   // 查找目标成员数据
   var memberName = params && params.memberName;
   var circleId = params && params.circleId || appState.activeCircleId;
-  var circle = appState.circles.find(function(c) { return c.id === circleId; });
+  var circle = appState.circles.find(function(c) { return c.id === circleId; }) || appState.circles[0] || null;
   var member = null;
   if (circle && circle.memberList && memberName) {
-    member = circle.memberList.find(function(m) { return m.name === memberName; });
+    member = circle.memberList.find(function(m) { return isSameNick(m && m.name, memberName); });
+  }
+  if (!member && memberName) {
+    member = { emoji: '👤', name: memberName, score: 0, slogan: '' };
   }
   if (!member) {
-    member = { emoji: '🦊', name: 'Monk', score: 142, slogan: '能动就行' };
-    circle = appState.circles.find(function(c) { return c.id === 'preset-1'; });
-    memberName = 'Monk';
+    member = {
+      emoji: appState.emoji || '👤',
+      name: appState.nick || '成员',
+      score: getMyWeekPts(),
+      slogan: appState.slogan || ''
+    };
   }
+  memberName = member.name;
 
-  var isMe = member.isMe || member.name === appState.nick;
+  var isMe = !!member.isMe || isSameNick(member.name, appState.nick);
 
   // —— 周冠军：拉齐该用户的历史周冠军周次 ——
   var champWeeks = [];
@@ -9630,8 +9760,8 @@ function bioBody(params) {
   var allUsers = circle && circle.memberList ? [...circle.memberList].sort(function(a, b) {
     return getMemberWeekPts(b.name, b.score) - getMemberWeekPts(a.name, a.score);
   }) : [];
-  var theirCurRank = allUsers.findIndex(function(m) { return m.name === member.name; }) + 1;
-  var myCurRank = allUsers.findIndex(function(m) { return m.isMe || m.name === appState.nick; }) + 1;
+  var theirCurRank = allUsers.findIndex(function(m) { return isSameNick(m && m.name, member.name); }) + 1;
+  var myCurRank = allUsers.findIndex(function(m) { return (m && m.isMe) || isSameNick(m && m.name, appState.nick); }) + 1;
   if (theirCurRank === 0) theirCurRank = allUsers.length;
   if (myCurRank === 0) myCurRank = allUsers.length;
   // 本周积分：和排行榜用同一份逻辑（getMemberWeekPts）
@@ -9645,8 +9775,8 @@ function bioBody(params) {
   var weekLabels = [];
   snapshots.forEach(function(s) {
     weekLabels.push(s.weekKey.replace('2026-W', 'W'));
-    var theirEntry = s.rankings.find(function(r) { return r.name === member.name; });
-    var myEntry = s.rankings.find(function(r) { return r.name === appState.nick; });
+    var theirEntry = s.rankings.find(function(r) { return isSameNick(r && r.name, member.name); });
+    var myEntry = s.rankings.find(function(r) { return isSameNick(r && r.name, appState.nick); });
     theirPtsHistory.push(theirEntry ? theirEntry.pts : 0);
     myPtsHistory.push(myEntry ? myEntry.pts : 0);
   });
@@ -9733,8 +9863,8 @@ function bioBody(params) {
         pts: r.points || 0
       };
     });
-  } else if (appState.memberRecentRecords && appState.memberRecentRecords[memberName]) {
-    records = appState.memberRecentRecords[memberName].slice(0, 3);
+  } else {
+    records = getMemberRecentRecordsByName(memberName).slice(0, 3);
   }
 
   // 周冠军周次 badges（已移除：根据用户反馈，只显示计数 N，不显示 🏆 W22/W23 徽章）
@@ -9906,7 +10036,7 @@ function bioBody(params) {
     ' + (isMe ? '' : '\
     <div class="card-elev-2" style="border-radius:14px;padding:14px;margin:0 0 14px">\
       <div style="font-size:14px;font-weight:600;margin-bottom:4px">积分记录对比（周）</div>\
-      ' + (snapshots.length === 0 ? '<div style="text-align:center;padding:24px 0;color:var(--text-3);font-size:13px">该圈子暂无历史积分记录</div>' : '\
+      ' + (snapshots.length === 0 ? '<div style="text-align:center;padding:24px 0;color:var(--text-3);font-size:13px">暂无历史周趋势，当前：' + memberName + ' ' + theirScore + ' 分 · 你 ' + getMyWeekPts() + ' 分</div>' : '\
       <div style="display:flex;gap:16px;font-size:11px;color:var(--text-3);margin-bottom:6px">\
         <span><span style="color:' + theirColor + '">━━</span> ' + memberName + '</span>\
         <span><span style="color:' + myColor + '">━━</span> 你</span>\
@@ -10167,7 +10297,9 @@ if (loadAppState()) {
     pollTimer: null,
     lastFetchAt: 0,
     pollingMs: 3000,
-    bootstrapped: false
+    bootstrapped: false,
+    lastProbeAt: 0,
+    lastErrorAt: 0
   };
   window._sharedFeed = sharedState;
 
@@ -10223,12 +10355,7 @@ if (loadAppState()) {
 
   function upsertPostIntoCircle(post, circleId) {
     if (!circleId) return;
-    if (!window._userPostsByCircle) window._userPostsByCircle = {};
-    if (!window._userPostsByCircle[circleId]) window._userPostsByCircle[circleId] = [];
-    const list = window._userPostsByCircle[circleId];
-    const idx = list.findIndex(p => p.id === post.id);
-    if (idx >= 0) list[idx] = post;
-    else list.unshift(post);
+    upsertCommunityPostInStore(post, circleId);
   }
 
   function upsertPostEverywhere(post) {
@@ -10256,16 +10383,32 @@ if (loadAppState()) {
     try {
       const data = await api('/api/shared/feed?circleId=' + encodeURIComponent(active.id) + '&viewer=' + encodeURIComponent(appState.nick), 'GET');
       const posts = (data.posts || []).map(normalizePost);
-      if (!window._userPostsByCircle) window._userPostsByCircle = {};
-      window._userPostsByCircle[active.id] = posts;
+      const store = ensureCommunityPostsStore();
+      const localPosts = Array.isArray(store[active.id]) ? store[active.id] : [];
+      const merged = [];
+      const seen = new Set();
+      posts.forEach(function(p) {
+        if (!p || !p.id || seen.has(p.id)) return;
+        seen.add(p.id);
+        merged.push(p);
+      });
+      localPosts.forEach(function(p) {
+        if (!p || !p.id || seen.has(p.id)) return;
+        const normalizedLocal = normalizeCommunityPostLite(p, active.id);
+        if (!normalizedLocal) return;
+        seen.add(normalizedLocal.id);
+        merged.push(normalizedLocal);
+      });
+      merged.sort(function(a, b) { return parsePostTimestamp(b) - parsePostTimestamp(a); });
+      store[active.id] = merged.slice(0, 100);
       sharedState.lastFetchAt = Date.now();
       if (!silent) {
         _origRenderCommunityFeed();
       }
     } catch (err) {
-      if (!silent) showToast('共享数据拉取失败，已回退本地模式');
-      sharedState.enabled = false;
-      stopPolling();
+      // 不要因一次网络抖动永久关闭 shared：否则后续只走本地，导致他端看不到帖子
+      if (!silent) showToast('共享数据拉取失败，将自动重试');
+      sharedState.lastErrorAt = Date.now();
     }
   }
 
@@ -10285,8 +10428,15 @@ if (loadAppState()) {
   }
 
   async function ensureSharedMode() {
-    if (sharedState.bootstrapped) return sharedState.enabled;
+    // 已启用时直接复用
+    if (sharedState.bootstrapped && sharedState.enabled) return true;
+    // 刚失败过则做短暂退避，避免连续探测打满日志
+    if (sharedState.bootstrapped && !sharedState.enabled && Date.now() - (sharedState.lastProbeAt || 0) < 5000) {
+      return false;
+    }
+
     sharedState.bootstrapped = true;
+    sharedState.lastProbeAt = Date.now();
     try {
       await api('/api/shared/health', 'GET');
       sharedState.enabled = true;
@@ -10298,6 +10448,7 @@ if (loadAppState()) {
       return true;
     } catch (err) {
       sharedState.enabled = false;
+      sharedState.lastErrorAt = Date.now();
       return false;
     }
   }
@@ -10342,8 +10493,14 @@ if (loadAppState()) {
     if (!text) { showToast('写点什么再发布吧'); return; }
 
     const sel = window._postEditor?.selectedCircleIds;
-    const circleIds = (sel && sel.size > 0) ? Array.from(sel) : [appState.activeCircleId];
-    const primaryCircle = appState.circles.find(c => c.id === circleIds[0]);
+    const activeCircle = appState.circles.find(c => c.id === appState.activeCircleId) || appState.circles[0];
+    const selectedIds = (sel && sel.size > 0) ? Array.from(sel) : [activeCircle ? activeCircle.id : null];
+    const circleIds = selectedIds.filter(Boolean);
+    if (circleIds.length === 0) {
+      showToast('请先加入圈子后再发帖');
+      return;
+    }
+    const primaryCircle = appState.circles.find(c => c.id === circleIds[0]) || activeCircle;
 
     try {
       const selectedImage = getSelectedPostImagePayload();
@@ -10361,6 +10518,7 @@ if (loadAppState()) {
       safeRevokeObjectURL(window._postEditor?.image?.localPath);
       window._postEditor = { text: '', image: null, selectedCircleIds: null };
       closeModal();
+      saveAppState();
       _origRenderCommunityFeed();
       if (circleIds.length === 1) showToast('✅ 已发布到「' + (primaryCircle?.name || '圈子') + '」');
       else showToast('✅ 已发布到 ' + circleIds.length + ' 个圈子');
@@ -10368,9 +10526,11 @@ if (loadAppState()) {
       const msg = String(err && err.message || '');
       if (msg.includes('413')) {
         showToast('图片仍偏大，已压缩到极限，请换一张更小的图');
-      } else {
-        showToast('发布失败，请稍后再试');
+        return;
       }
+      // 兜底：shared 不可用时回退本地发布，避免“刚发完刷新就没了”
+      _origSubmitPost();
+      showToast('云端暂不可用，已本地发布并写入同步队列');
     }
   };
 
