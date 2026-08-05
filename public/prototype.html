@@ -1079,6 +1079,8 @@
   .app.no-tab .splash { display: flex; }
   .app.no-tab .sidebar-overlay { display: none; }
   .app.no-tab .modal-overlay { display: none; }
+  .app.no-tab .sync-debug-toggle,
+  .app.no-tab .sync-debug-panel { display: none; }
 
   /* 趋势图 */
   .chart-svg { width: 100%; height: 80px; margin-top: 8px; }
@@ -1359,6 +1361,74 @@
   }
   .points-inline .pi-label { font-size: 13px; color: var(--text-3); }
   .points-inline .pi-value { font-size: 20px; font-weight: 700; color: var(--green); }
+
+  /* 同步调试面板 */
+  .sync-debug-toggle {
+    position: absolute;
+    right: 16px;
+    bottom: 96px;
+    z-index: 90;
+    border: 0;
+    border-radius: 999px;
+    padding: 8px 12px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.2px;
+    background: var(--purple);
+    color: #fff;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.22);
+    cursor: pointer;
+  }
+  .sync-debug-toggle.offline {
+    background: var(--bg-elev-3);
+    color: var(--text-3);
+  }
+  .sync-debug-panel {
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    bottom: 148px;
+    z-index: 89;
+    background: rgba(20,22,28,0.95);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 12px;
+    box-shadow: 0 10px 24px rgba(0,0,0,0.32);
+    color: #E8ECF8;
+    display: none;
+    overflow: hidden;
+    max-height: 50vh;
+  }
+  .sync-debug-panel.show { display: block; }
+  .sync-debug-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border-bottom: 1px solid rgba(255,255,255,0.1);
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .sync-debug-close {
+    border: 0;
+    background: transparent;
+    color: #BFC8DC;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .sync-debug-body {
+    padding: 10px 12px 12px;
+    overflow: auto;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-size: 11px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .sync-debug-body .k { color: #9CC4FF; }
+  .sync-debug-body .v { color: #E8ECF8; }
+  .sync-debug-body .warn { color: #FFCC66; }
+  .sync-debug-body .ok { color: #6EE7A8; }
 </style>
 </head>
 <body>
@@ -1800,6 +1870,15 @@
         <span class="tab-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 11l18-8-8 18-2-8-8-2z"/></svg></span>
         <span class="tab-label">社群</span>
       </button>
+    </div>
+
+    <button class="sync-debug-toggle" id="syncDebugToggle" type="button" onclick="toggleSyncDebugPanel()">SYNC 调试</button>
+    <div class="sync-debug-panel" id="syncDebugPanel">
+      <div class="sync-debug-head">
+        <span>跨用户同步调试面板</span>
+        <button class="sync-debug-close" type="button" onclick="toggleSyncDebugPanel(false)">×</button>
+      </div>
+      <div class="sync-debug-body" id="syncDebugBody">等待同步数据...</div>
     </div>
 
     <!-- Toast -->
@@ -2842,6 +2921,7 @@ function pushNotification(arg1, arg2) {
         same.body = mergeNotifBody(same.type, same.body, n.body, same._count);
       }
       if (typeof updateNotifBadge === 'function') updateNotifBadge();
+      updateSyncDebugPanel('push-notification-merge', { note: '聚合通知 type=' + (n.type || '-'), changed: true });
       return;
     }
   }
@@ -2859,6 +2939,10 @@ function pushNotification(arg1, arg2) {
   if (appState.notifications.length > 50) appState.notifications = appState.notifications.slice(0, 50);
   // 角标更新
   if (typeof updateNotifBadge === 'function') updateNotifBadge();
+  updateSyncDebugPanel('push-notification', {
+    note: '新增通知 type=' + (n.type || '-'),
+    changed: true
+  });
 }
 
 // 同类通知 body 合并（按类型定制）
@@ -8207,6 +8291,8 @@ function resetToRegistrationPage() {
   });
 
   // 6. 直接进入注册页（不走 splash 开屏）
+  toggleSyncDebugPanel(false);
+  updateSyncDebugPanel('logout-reset', { note: '已退出登录并清空状态', changed: true });
   showRegisterPage();
 }
 
@@ -8214,6 +8300,130 @@ function resetToRegistrationPage() {
 const LS_KEY = 'juanfu_user';
 let cloudSyncTimer = null;
 let cloudSyncActiveNick = '';
+let syncDebugPanelOpen = false;
+const syncDebugState = {
+  lastReason: 'init',
+  lastCloudUpdated: '',
+  lastChanged: false,
+  lastError: '',
+  lastDirectory: [],
+  lastNote: '',
+  lastAt: ''
+};
+
+function fmtSyncTime(ts) {
+  if (!ts) return '-';
+  const t = typeof ts === 'number' ? ts : Date.parse(ts);
+  if (isNaN(t)) return String(ts);
+  return new Date(t).toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+function summarizeActiveCircleForDebug() {
+  if (!Array.isArray(appState.circles) || appState.circles.length === 0) return null;
+  const active = appState.circles.find(function(c) { return c.id === appState.activeCircleId; }) || appState.circles[0];
+  if (!active) return null;
+  const myPts = Number(getWeekPointsFromRecords());
+  const myRank = computeMyRankInCircle(active, myPts);
+  const members = Array.isArray(active.memberList) ? active.memberList.slice() : [];
+  members.sort(function(a, b) { return Number(b.score || 0) - Number(a.score || 0); });
+  const top = members.slice(0, 6).map(function(m, idx) {
+    var tags = [];
+    if (m.isLeader) tags.push('L');
+    if (m.isMe) tags.push('ME');
+    return (idx + 1) + '.' + m.name + '(' + Number(m.score || 0) + (tags.length ? ',' + tags.join('|') : '') + ')';
+  });
+  return {
+    id: active.id,
+    name: active.name,
+    role: active.role,
+    pending: !!active.pending,
+    members: members.length,
+    myRank: myRank,
+    top: top
+  };
+}
+
+function setSyncDebugToggleState() {
+  const btn = document.getElementById('syncDebugToggle');
+  if (!btn) return;
+  const online = !!(appState && appState.onboardingDone && appState.nick);
+  btn.classList.toggle('offline', !online);
+  btn.textContent = syncDebugPanelOpen ? '关闭调试' : 'SYNC 调试';
+}
+
+function renderSyncDebugPanel() {
+  setSyncDebugToggleState();
+  const panel = document.getElementById('syncDebugPanel');
+  const body = document.getElementById('syncDebugBody');
+  if (!panel || !body) return;
+  panel.classList.toggle('show', !!syncDebugPanelOpen);
+  if (!syncDebugPanelOpen) return;
+
+  const active = summarizeActiveCircleForDebug();
+  const weekFromRecords = Number(getWeekPointsFromRecords());
+  const lines = [];
+  lines.push('账号: ' + (appState.nick || '-') + '  |  同步会话: ' + (cloudSyncActiveNick || '-') + '  |  轮询: ' + (cloudSyncTimer ? 'ON' : 'OFF'));
+  lines.push('触发: ' + syncDebugState.lastReason + '  |  时间: ' + (syncDebugState.lastAt || '-'));
+  lines.push('本地updated_at: ' + (appState.updated_at || '-') + '  |  云端updated_at: ' + (syncDebugState.lastCloudUpdated || '-'));
+  lines.push('变更: ' + (syncDebugState.lastChanged ? 'YES' : 'NO') + '  |  备注: ' + (syncDebugState.lastNote || '-') + (syncDebugState.lastError ? ('  |  错误: ' + syncDebugState.lastError) : ''));
+  lines.push('本周积分(记录和): ' + weekFromRecords + '  |  weeklyPoints字段: ' + Number(appState.weeklyPoints || 0) + '  |  记录条数: ' + ((appState.todayRecords || []).length));
+
+  if (!active) {
+    lines.push('当前圈子: 无');
+  } else {
+    lines.push('当前圈子: ' + active.name + ' [' + active.id + '] role=' + active.role + ' pending=' + active.pending + ' members=' + active.members + ' myRank=' + active.myRank);
+    lines.push('成员分数TOP: ' + (active.top.length ? active.top.join(' / ') : '-'));
+  }
+
+  const rankBaseline = appState.lastCircleRanks ? JSON.stringify(appState.lastCircleRanks) : '{}';
+  lines.push('rank基线(lastCircleRanks): ' + rankBaseline);
+
+  const recentNotifs = (appState.notifications || []).slice(0, 3).map(function(n) {
+    var t = fmtSyncTime(n.createdAt || n.time);
+    return '[' + t + '] ' + (n.type || '-') + ' | ' + (n.body || n.title || '');
+  });
+  lines.push('最近通知:');
+  lines.push(recentNotifs.length ? ('- ' + recentNotifs.join('\n- ')) : '- (无)');
+
+  const directory = Array.isArray(syncDebugState.lastDirectory) ? syncDebugState.lastDirectory : [];
+  lines.push('云端目录快照(最近1轮):');
+  if (directory.length === 0) {
+    lines.push('- (无)');
+  } else {
+    directory.slice(0, 8).forEach(function(d) {
+      lines.push('- ' + d.nick + ': week=' + d.weekPts + ', updated=' + (d.updatedAt || '-'));
+    });
+  }
+
+  body.textContent = lines.join('\n');
+}
+
+function updateSyncDebugPanel(reason, extra) {
+  syncDebugState.lastReason = reason || syncDebugState.lastReason;
+  syncDebugState.lastAt = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  if (extra) {
+    if (extra.cloudUpdated) syncDebugState.lastCloudUpdated = extra.cloudUpdated;
+    if (extra.changed !== undefined) syncDebugState.lastChanged = !!extra.changed;
+    if (extra.error) syncDebugState.lastError = String(extra.error);
+    if (extra.note) syncDebugState.lastNote = String(extra.note);
+    if (Array.isArray(extra.directory)) {
+      syncDebugState.lastDirectory = extra.directory.map(function(u) {
+        return {
+          nick: u.nick,
+          weekPts: Number(getWeekPointsFromState(u.app_state || {})),
+          updatedAt: u.app_state && u.app_state.updated_at ? u.app_state.updated_at : '-'
+        };
+      });
+    }
+  }
+  renderSyncDebugPanel();
+}
+
+function toggleSyncDebugPanel(forceOpen) {
+  if (typeof forceOpen === 'boolean') syncDebugPanelOpen = forceOpen;
+  else syncDebugPanelOpen = !syncDebugPanelOpen;
+  renderSyncDebugPanel();
+}
 
 function stopCloudSync() {
   if (cloudSyncTimer) {
@@ -8221,6 +8431,7 @@ function stopCloudSync() {
     cloudSyncTimer = null;
   }
   cloudSyncActiveNick = '';
+  updateSyncDebugPanel('sync-stop', { note: '轮询已停止', changed: false });
 }
 
 function nickKey(name) {
@@ -8461,6 +8672,7 @@ function refreshViewsAfterCloudSync() {
   refreshDashboard();
   refreshRecordPage();
   renderCommunityFeed();
+  updateSyncDebugPanel('refresh-views', { note: 'UI刷新完成' });
 }
 
 function reconcileCrossUserCirclesFromCloudDirectory(allUsers) {
@@ -8609,6 +8821,7 @@ function startCloudSync() {
 
   var CLOUD_SYNC_INTERVAL = 10000;
   cloudSyncActiveNick = appState.nick;
+  updateSyncDebugPanel('sync-start', { note: '开始轮询 nick=' + cloudSyncActiveNick, changed: false });
 
   function scheduleNext() {
     cloudSyncTimer = setTimeout(cloudSyncOnce, CLOUD_SYNC_INTERVAL);
@@ -8626,6 +8839,7 @@ function startCloudSync() {
     var localUpdated = appState.updated_at || '';
 
     if (typeof sb === 'undefined' || !sb) {
+      updateSyncDebugPanel('sync-skip', { note: 'Supabase客户端不可用', changed: false });
       scheduleNext();
       return;
     }
@@ -8656,6 +8870,13 @@ function startCloudSync() {
         if (normalizeAllCirclesState()) changed = true;
       }
 
+      updateSyncDebugPanel(changed ? 'sync-apply' : 'sync-idle', {
+        changed: changed,
+        cloudUpdated: cloud && cloud.updated_at ? cloud.updated_at : '',
+        directory: Array.isArray(directoryRes.data) ? directoryRes.data : [],
+        note: 'local=' + (localUpdated || '-') + ', dir=' + (Array.isArray(directoryRes.data) ? directoryRes.data.length : 0)
+      });
+
       if (changed) {
         appState.nick = cloudSyncActiveNick;
 
@@ -8675,12 +8896,18 @@ function startCloudSync() {
       }
 
       scheduleNext();
-    }).catch(function() {
+    }).catch(function(err) {
+      updateSyncDebugPanel('sync-error', {
+        changed: false,
+        error: err && err.message ? err.message : String(err || 'unknown'),
+        note: '本轮同步失败'
+      });
       scheduleNext();
     });
   }
 
   cloudSyncTimer = setTimeout(cloudSyncOnce, 1500);
+  setSyncDebugToggleState();
 }
 
 function saveAppState() {
@@ -8721,6 +8948,11 @@ function saveAppState() {
     data.updated_at = now;
     appState.updated_at = now;
     localStorage.setItem(LS_KEY, JSON.stringify(data));
+    updateSyncDebugPanel('save-app-state', {
+      note: '本地与云端写回触发',
+      cloudUpdated: now,
+      changed: true
+    });
     // 云端同步（异步、静默）
     if (typeof sb !== 'undefined' && sb && appState.nick) {
       sb.from('users').upsert({
@@ -8728,10 +8960,23 @@ function saveAppState() {
         app_state: data,
         updated_at: now
       }).then(function(res) {
-        if (res.error) console.warn('[Supabase] save:', res.error.message);
+        if (res.error) {
+          console.warn('[Supabase] save:', res.error.message);
+          updateSyncDebugPanel('save-error', {
+            changed: false,
+            error: res.error.message,
+            note: '云端写回失败'
+          });
+        }
       });
     }
-  } catch(e) { /* 静默 */ }
+  } catch(e) {
+    updateSyncDebugPanel('save-exception', {
+      changed: false,
+      error: e && e.message ? e.message : String(e),
+      note: 'saveAppState异常'
+    });
+  }
 }
 
 // 从 Supabase 拉取云端数据（用于新设备登录 / 数据恢复）
@@ -8764,6 +9009,11 @@ async function loginFromCloud(nick) {
   normalizeAllCirclesState();
   // 写本地缓存
   try { localStorage.setItem(LS_KEY, JSON.stringify(appState)); } catch(e) {}
+  updateSyncDebugPanel('login-from-cloud', {
+    changed: true,
+    cloudUpdated: cloudData.updated_at || '',
+    note: '云端登录完成 nick=' + nick
+  });
   return true;
 }
 function loadAppState() {
@@ -8870,6 +9120,11 @@ function loadAppState() {
     normalizeAllCirclesState();
     // 恢复后立即更新通知角标
     updateNotifBadge();
+    updateSyncDebugPanel('load-local-state', {
+      changed: true,
+      cloudUpdated: appState.updated_at || '',
+      note: '本地缓存恢复完成'
+    });
     return true;
   } catch(e) { return false; }
 }
@@ -9811,6 +10066,10 @@ const url = new URL(location.href);
 const isQA = url.searchParams.get('qa') === '1';
 const withCircles = isQA && url.searchParams.get('circles') === '1';
 const viewParam = url.searchParams.get('view');
+const autoOpenSyncDebug = url.searchParams.get('syncDebug') === '1';
+setSyncDebugToggleState();
+updateSyncDebugPanel('init', { note: '页面初始化', changed: false });
+if (autoOpenSyncDebug) toggleSyncDebugPanel(true);
 
 // 老用户 demo：仅 QA 显式参数才允许 seed，避免污染真实用户数据
 if (withCircles) {
