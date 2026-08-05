@@ -315,7 +315,8 @@ const buildSharedPostView = (post, viewerName) => {
     }
   });
 
-  const likeSet = new Set(likes.map(x => x.user_name));
+  const likeUsers = likes.map(x => x.user_name).filter(Boolean);
+  const likeSet = new Set(likeUsers);
   const circleIds = parseCircleIds(post.circle_ids_json, post.circle_id);
 
   return {
@@ -330,6 +331,7 @@ const buildSharedPostView = (post, viewerName) => {
     time: '刚刚',
     likes: likeSet.size,
     liked: viewerName ? likeSet.has(viewerName) : false,
+    likeUsers,
     commentsList
   };
 };

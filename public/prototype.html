@@ -2166,6 +2166,7 @@ function normalizeCommunityPostLite(post, fallbackCircleId) {
     time: post.time || '刚刚',
     likes: Number(post.likes || 0),
     liked: !!post.liked,
+    likeUsers: Array.isArray(post.likeUsers) ? post.likeUsers.filter(Boolean) : [],
     commentsList: Array.isArray(post.commentsList) ? post.commentsList : []
   };
 }
@@ -3021,8 +3022,13 @@ function pushNotification(arg1, arg2) {
                   n.type;
   if (ns[typeKey] === false) return;
 
+  // 避免重复：eventKey 唯一（社群互动增量事件）
+  if (n.eventKey) {
+    const existEvent = appState.notifications.find(x => x.eventKey === n.eventKey && x.type === n.type);
+    if (existEvent) return;
+  }
   // 避免重复：postId+type+fromName 组合唯一（社群互动）
-  if (n.postId) {
+  if (n.postId && !n.eventKey) {
     const exist = appState.notifications.find(x =>
       x.postId === n.postId &&
       x.type === n.type &&
@@ -10399,8 +10405,92 @@ if (loadAppState()) {
       time: formatAgoSafe(post.createdAt || post.time),
       likes: post.likes || 0,
       liked: !!post.liked,
+      likeUsers: Array.isArray(post.likeUsers) ? post.likeUsers.filter(Boolean) : [],
       commentsList: (post.commentsList || []).map(normalizeComment)
     };
+  }
+
+  function isCommunityTabActive() {
+    const tab = document.querySelector('.tab[data-page="community"]');
+    return !!(tab && tab.classList.contains('active'));
+  }
+
+  function flattenPostCommentEvents(post) {
+    const events = [];
+    if (!post || !Array.isArray(post.commentsList)) return events;
+
+    function walk(comment) {
+      if (!comment) return;
+      const fallbackId = [
+        'c',
+        nickKey(comment.name || ''),
+        String(comment.content || '').slice(0, 40),
+        String(comment.createdAt || comment.time || '')
+      ].join('|');
+      events.push({
+        id: comment.id || fallbackId,
+        name: comment.name || '',
+        content: comment.content || ''
+      });
+      (comment.replies || []).forEach(walk);
+    }
+
+    post.commentsList.forEach(walk);
+    return events;
+  }
+
+  function emitSocialNotificationsFromDiff(prevMap, nextMap) {
+    if (!prevMap || !nextMap) return;
+    nextMap.forEach(function(nextPost, key) {
+      const prevPost = prevMap.get(key);
+      if (!prevPost) return; // 首次拉取不补历史通知
+      if (!nextPost || !isSameNick(nextPost.name, appState.nick)) return; // 只给帖子作者发提醒
+
+      const prevLikeUsers = new Set((Array.isArray(prevPost.likeUsers) ? prevPost.likeUsers : []).map(function(n) { return nickKey(n); }));
+      const nextLikeUsers = Array.isArray(nextPost.likeUsers) ? nextPost.likeUsers : [];
+      let likeNotified = false;
+      nextLikeUsers.forEach(function(name) {
+        if (!name || isSameNick(name, appState.nick)) return;
+        const nk = nickKey(name);
+        if (prevLikeUsers.has(nk)) return;
+        likeNotified = true;
+        pushNotification({
+          type: 'like',
+          title: '❤️ ' + name + ' 赞了你的动态',
+          body: '你的动态收到新点赞',
+          postId: nextPost.id,
+          fromName: name,
+          fromEmoji: '',
+          eventKey: 'like|' + nextPost.id + '|' + nk + '|' + String(nextPost.likes || 0)
+        });
+      });
+      if (!likeNotified && Number(nextPost.likes || 0) > Number(prevPost.likes || 0)) {
+        pushNotification({
+          type: 'like',
+          title: '❤️ 你的动态收到新赞',
+          body: '有圈友赞了你的动态',
+          postId: nextPost.id,
+          fromName: '',
+          fromEmoji: '',
+          eventKey: 'like-generic|' + nextPost.id + '|' + String(nextPost.likes || 0)
+        });
+      }
+
+      const prevCommentIds = new Set(flattenPostCommentEvents(prevPost).map(function(c) { return c.id; }));
+      flattenPostCommentEvents(nextPost).forEach(function(c) {
+        if (!c || !c.id || prevCommentIds.has(c.id)) return;
+        if (!c.name || isSameNick(c.name, appState.nick)) return;
+        pushNotification({
+          type: 'comment',
+          title: '💬 ' + c.name + ' 评论了你',
+          body: c.content ? ('在你的动态下说：' + c.content) : '你的动态收到新评论',
+          postId: nextPost.id,
+          fromName: c.name,
+          fromEmoji: '',
+          eventKey: 'comment|' + nextPost.id + '|' + c.id
+        });
+      });
+    });
   }
 
   function upsertPostIntoCircle(post, circleId) {
@@ -10435,7 +10525,17 @@ if (loadAppState()) {
       const posts = (data.posts || []).map(normalizePost);
       const store = ensureCommunityPostsStore();
       const localPosts = Array.isArray(store[active.id]) ? store[active.id] : [];
+      const prevMap = new Map();
+      localPosts.forEach(function(p) {
+        const normalized = normalizeCommunityPostLite(p, active.id);
+        if (!normalized) return;
+        const key = getCommunityPostStableId(normalized, active.id);
+        normalized.id = key;
+        prevMap.set(key, normalized);
+      });
+
       const merged = [];
+      const nextMap = new Map();
       const seen = new Set();
       posts.forEach(function(p) {
         if (!p) return;
@@ -10446,6 +10546,7 @@ if (loadAppState()) {
         normalizedRemote.id = key;
         seen.add(key);
         merged.push(normalizedRemote);
+        nextMap.set(key, normalizedRemote);
       });
       localPosts.forEach(function(p) {
         if (!p) return;
@@ -10456,11 +10557,22 @@ if (loadAppState()) {
         normalizedLocal.id = key;
         seen.add(key);
         merged.push(normalizedLocal);
+        nextMap.set(key, normalizedLocal);
       });
       merged.sort(function(a, b) { return parsePostTimestamp(b) - parsePostTimestamp(a); });
-      store[active.id] = merged.slice(0, 100);
+      const nextPosts = merged.slice(0, 100);
+      const oldJson = JSON.stringify(localPosts || []);
+      const nextJson = JSON.stringify(nextPosts || []);
+      const changed = oldJson !== nextJson;
+      store[active.id] = nextPosts;
+
+      // 仅在非首次轮询时，根据 shared feed 增量给帖子作者补社交通知
+      if (changed && sharedState.lastFetchAt > 0) {
+        emitSocialNotificationsFromDiff(prevMap, nextMap);
+      }
+
       sharedState.lastFetchAt = Date.now();
-      if (!silent) {
+      if (changed && (!silent || isCommunityTabActive())) {
         _origRenderCommunityFeed();
       }
     } catch (err) {
