@@ -2128,9 +2128,26 @@ function parsePostTimestamp(post) {
   return 0;
 }
 
+function buildCommunityPostFingerprint(post, fallbackCircleId) {
+  const circleId = (post && (post.circleId || fallbackCircleId || appState.activeCircleId)) || '';
+  const author = nickKey((post && post.name) || '');
+  const content = String((post && post.content) || '').trim();
+  const image = String((post && (post.imageUrl || post.image)) || '').slice(0, 120);
+  const created = String((post && (post.createdAt || post.time)) || '');
+  return ['fp', circleId, author, content, image, created].join('|');
+}
+
+function getCommunityPostStableId(post, fallbackCircleId) {
+  if (post && post.id !== undefined && post.id !== null) {
+    const rawId = String(post.id).trim();
+    if (rawId) return rawId;
+  }
+  return buildCommunityPostFingerprint(post || {}, fallbackCircleId);
+}
+
 function normalizeCommunityPostLite(post, fallbackCircleId) {
   if (!post || typeof post !== 'object') return null;
-  const id = post.id || ('post-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
+  const id = getCommunityPostStableId(post, fallbackCircleId);
   const circleId = post.circleId || fallbackCircleId || appState.activeCircleId || null;
   const circleIds = Array.isArray(post.circleIds) && post.circleIds.length > 0
     ? post.circleIds.filter(Boolean)
@@ -2158,11 +2175,35 @@ function ensureCommunityPostsStore() {
     appState.communityPostsByCircle = {};
   }
   if (window._userPostsByCircle && window._userPostsByCircle !== appState.communityPostsByCircle) {
-    Object.keys(window._userPostsByCircle).forEach(function(cid) {
-      if (!Array.isArray(window._userPostsByCircle[cid])) return;
-      if (!Array.isArray(appState.communityPostsByCircle[cid])) appState.communityPostsByCircle[cid] = [];
-      appState.communityPostsByCircle[cid] = appState.communityPostsByCircle[cid].concat(window._userPostsByCircle[cid]);
+    const incoming = window._userPostsByCircle;
+    const merged = {};
+    const allCircleIds = new Set([
+      ...Object.keys(appState.communityPostsByCircle || {}),
+      ...Object.keys(incoming || {})
+    ]);
+
+    allCircleIds.forEach(function(cid) {
+      const byId = {};
+      function ingest(list) {
+        (Array.isArray(list) ? list : []).forEach(function(post) {
+          const normalized = normalizeCommunityPostLite(post, cid);
+          if (!normalized) return;
+          const key = getCommunityPostStableId(normalized, cid);
+          const prev = byId[key];
+          if (!prev || parsePostTimestamp(normalized) >= parsePostTimestamp(prev)) {
+            normalized.id = key;
+            byId[key] = normalized;
+          }
+        });
+      }
+      ingest(appState.communityPostsByCircle[cid]);
+      ingest(incoming[cid]);
+      merged[cid] = Object.values(byId)
+        .sort(function(a, b) { return parsePostTimestamp(b) - parsePostTimestamp(a); })
+        .slice(0, 100);
     });
+
+    appState.communityPostsByCircle = merged;
   }
   window._userPostsByCircle = appState.communityPostsByCircle;
   return appState.communityPostsByCircle;
@@ -2176,7 +2217,11 @@ function upsertCommunityPostInStore(post, circleId) {
   const normalized = normalizeCommunityPostLite(post, circleId);
   if (!normalized) return;
   const list = store[circleId];
-  const idx = list.findIndex(function(p) { return p && p.id === normalized.id; });
+  const stableId = getCommunityPostStableId(normalized, circleId);
+  normalized.id = stableId;
+  const idx = list.findIndex(function(p) {
+    return p && getCommunityPostStableId(p, circleId) === stableId;
+  });
   if (idx >= 0) list[idx] = normalized;
   else list.unshift(normalized);
   list.sort(function(a, b) { return parsePostTimestamp(b) - parsePostTimestamp(a); });
@@ -5427,7 +5472,10 @@ function finalizeSubmit(record) {
         liked: !!sp.liked,
         commentsList: sp.commentsList || []
       };
+      const store = ensureCommunityPostsStore();
       (serverPost.circleIds || [circleId]).forEach(function(cid) {
+        const list = Array.isArray(store[cid]) ? store[cid] : [];
+        store[cid] = list.filter(function(p) { return !(p && p.id === newPost.id); });
         upsertCommunityPostInStore(serverPost, cid);
       });
       saveAppState();
@@ -8817,10 +8865,12 @@ function reconcileCrossUserCirclesFromCloudDirectory(allUsers) {
 
     function ingestPost(post) {
       var normalized = normalizeCommunityPostLite(post, cid);
-      if (!normalized || !normalized.id) return;
-      var prev = byId[normalized.id];
+      if (!normalized) return;
+      var key = getCommunityPostStableId(normalized, cid);
+      normalized.id = key;
+      var prev = byId[key];
       if (!prev || parsePostTimestamp(normalized) >= parsePostTimestamp(prev)) {
-        byId[normalized.id] = normalized;
+        byId[key] = normalized;
       }
     }
 
@@ -10388,15 +10438,23 @@ if (loadAppState()) {
       const merged = [];
       const seen = new Set();
       posts.forEach(function(p) {
-        if (!p || !p.id || seen.has(p.id)) return;
-        seen.add(p.id);
-        merged.push(p);
+        if (!p) return;
+        const normalizedRemote = normalizeCommunityPostLite(p, active.id);
+        if (!normalizedRemote) return;
+        const key = getCommunityPostStableId(normalizedRemote, active.id);
+        if (seen.has(key)) return;
+        normalizedRemote.id = key;
+        seen.add(key);
+        merged.push(normalizedRemote);
       });
       localPosts.forEach(function(p) {
-        if (!p || !p.id || seen.has(p.id)) return;
+        if (!p) return;
         const normalizedLocal = normalizeCommunityPostLite(p, active.id);
         if (!normalizedLocal) return;
-        seen.add(normalizedLocal.id);
+        const key = getCommunityPostStableId(normalizedLocal, active.id);
+        if (seen.has(key)) return;
+        normalizedLocal.id = key;
+        seen.add(key);
         merged.push(normalizedLocal);
       });
       merged.sort(function(a, b) { return parsePostTimestamp(b) - parsePostTimestamp(a); });
