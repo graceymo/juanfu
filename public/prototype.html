@@ -3376,7 +3376,14 @@ function updateCircleCard(hasCircle) {
     arrow.style.display = 'flex';
 
     // Build member row（成员列表：从 active.memberList 读取，Gracey 替换为当前用户的 emoji/nick）
-    const list = (active.memberList || []).map(m => ({
+    // 🔧 修复：按名称去重，防止 memberList 中有重复成员
+    const seen = {};
+    const unique = (active.memberList || []).filter(m => {
+      if (seen[m.name]) return false;
+      seen[m.name] = true;
+      return true;
+    });
+    const list = unique.map(m => ({
       cls: 'circle-member' + (m.isLeader ? ' leader' : ''),
       avatar: `<div class="avatar" style="font-size:24px;background:#2C2C2E">${m.isMe ? appState.emoji : m.emoji}</div>`,
       name: m.isMe ? appState.nick : m.name
@@ -4031,6 +4038,9 @@ async function notifyCircleOwnerAboutJoinRequest(code) {
 // 组长通过/拒绝入圈申请后，通过 Supabase 更新申请人的状态
 async function syncApprovalToApplicant(applicantName, active, action) {
   if (typeof sb === 'undefined' || !sb) return;
+  // 🔧 修复：在 Supabase await 之前快照 memberList，防止 approveJoinRequest 之后 leader 侧 memberList
+  // 被其他操作修改（如 circleBody 策略2 全量扫描），导致 rebuild 时数据不一致
+  const snapMemberList = [...(active.memberList || [])];
   try {
     const { data } = await sb.from('users').select('app_state').eq('nick', applicantName).maybeSingle();
     if (!data) return;
@@ -4049,36 +4059,37 @@ async function syncApprovalToApplicant(applicantName, active, action) {
       // 🔧 修复：同步 activeCircleId，否则仪表盘 updateCircleCard 找不到圈子 → 显示空态
       applicantSt.activeCircleId = active.id;
 
-      // 🔧 修复：memberList 重新构建，不再直接覆盖（避免错误数据）
-      // 1) 从 active.memberList 中找到 leader entry（自己的），用 leader 当前真实数据
-      // 2) 其他人用 active.memberList 中对应 entry
-      // 3) 申请人自己（applicantName）从 active.memberList 中找出，加 isMe: true + role: 'member' + 真实周分
-      const leaderEntry = (active.memberList || []).find(m => m.isLeader) || { name: appState.nick, emoji: appState.emoji, score: 0 };
-      const leaderWeekPts = getMyWeekPts();  // leader 自己最新的周分
+      // 🔧 修复：memberList 重新构建（用快照数据 + Set 去重）
+      const leaderEntry = snapMemberList.find(m => m.isLeader) || { name: appState.nick, emoji: appState.emoji, score: 0 };
+      const leaderWeekPts = getMyWeekPts();
       const newMemberList = [];
-      // 先放 leader
+      const seen = new Set();
+      // Leader entry
       newMemberList.push({
         name: leaderEntry.name,
-        emoji: appState.emoji,  // 用 leader appState 实时 emoji（不依赖 active.memberList 里可能过时的数据）
+        emoji: leaderEntry.emoji || '👤',
         isMe: false,
         isLeader: true,
         score: leaderWeekPts,
         joinDate: leaderEntry.joinDate || getCurrentWeekKey()
       });
-      // 再放其他人（除 leader + applicant 之外）
-      for (const m of (active.memberList || [])) {
+      seen.add(leaderEntry.name);
+      // Others (skip leader + applicant, Set-based dedup)
+      for (const m of snapMemberList) {
         if (m.isLeader) continue;
         if (m.name === applicantName) continue;
+        if (seen.has(m.name)) continue;
         newMemberList.push({
           name: m.name,
-          emoji: m.emoji,
+          emoji: m.emoji || '👤',
           isMe: false,
           isLeader: false,
           score: m.score || 0,
           joinDate: m.joinDate || getCurrentWeekKey()
         });
+        seen.add(m.name);
       }
-      // 最后放 applicant 自己（用申请时的 emoji + 当前周分 = 0）
+      // Applicant entry (isMe: true, isLeader: false)
       const applicantEmoji = pendingCircle.memberList && pendingCircle.memberList[0] ? pendingCircle.memberList[0].emoji : '👤';
       newMemberList.push({
         name: applicantName,
@@ -8723,13 +8734,26 @@ function circleBody() {
       active._syncing = false;
     })();
   }
-  const list = active.memberList || [];
+  // 🔧 修复：按名称去重 memberList，防止重复成员显示
+  const rawList = active.memberList || [];
+  const seenNames = {};
+  const list = [];
+  for (const m of rawList) {
+    if (seenNames[m.name]) continue;
+    seenNames[m.name] = true;
+    // 修复：如果 active.role !== 'leader' 但成员中有人标了 isLeader，强制去除（数据自愈）
+    if (active.role !== 'leader' && m.isLeader && m.isMe) {
+      m.isLeader = false;
+    }
+    list.push(m);
+  }
   const myInList = list.find(m => m.isMe);
   const peers = list.filter(m => !m.isMe);
 
   // 我的行
   const myAvatar = `<div class="stat-icon" style="font-size:24px;background:#2C2C2E">${appState.emoji}</div>`;
-  const myMeta = myInList?.isLeader
+  // 🔧 修复：用 active.role 做唯一真相源判组长（而非 myInList.isLeader，后者可能被错误数据污染）
+  const myMeta = (active.role === 'leader')
     ? `<div class="stat-meta" style="color:var(--yellow)">★ 组长</div>`
     : `<div class="stat-meta">组员</div>`;
 
