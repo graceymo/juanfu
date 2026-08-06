@@ -159,6 +159,14 @@ db.exec(`
     FOREIGN KEY (comment_id) REFERENCES shared_comments(id) ON DELETE CASCADE
   );
 
+  CREATE TABLE IF NOT EXISTS shared_member_schedules (
+    member_name TEXT NOT NULL,
+    circle_id TEXT NOT NULL,
+    schedule_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (member_name, circle_id)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_shared_posts_updated_at ON shared_posts(updated_at DESC);
   CREATE INDEX IF NOT EXISTS idx_shared_comments_post ON shared_comments(post_id, created_at ASC);
 `);
@@ -618,6 +626,34 @@ app.get('/api/posts', (req, res) => {
 // ── API: Shared social feed (for prototype multi-device sync) ──
 app.get('/api/shared/health', (req, res) => {
   res.json({ ok: true, now: nowISO() });
+});
+
+// ── API: Shared member schedules (for bio page cross-user visibility) ──
+
+// GET /api/shared/member-schedules?memberName=Charlie
+app.get('/api/shared/member-schedules', (req, res) => {
+  const { memberName } = req.query;
+  if (!memberName) return res.status(400).json({ error: 'memberName required' });
+  const rows = db.prepare('SELECT * FROM shared_member_schedules WHERE member_name=?').all(memberName);
+  const result = {};
+  rows.forEach(r => {
+    try { result[r.circle_id] = JSON.parse(r.schedule_json); } catch (_) { result[r.circle_id] = {}; }
+  });
+  res.json({ schedules: result, serverTime: nowISO() });
+});
+
+// POST /api/shared/member-schedules
+app.post('/api/shared/member-schedules', (req, res) => {
+  const { memberName, circleId, schedule } = req.body || {};
+  if (!memberName || !circleId) return res.status(400).json({ error: 'memberName and circleId required' });
+  const now = nowISO();
+  const scheduleJson = JSON.stringify(schedule || {});
+  db.prepare(`
+    INSERT INTO shared_member_schedules (member_name, circle_id, schedule_json, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(member_name, circle_id) DO UPDATE SET schedule_json=excluded.schedule_json, updated_at=excluded.updated_at
+  `).run(memberName, circleId, scheduleJson, now);
+  res.json({ ok: true, memberName, circleId, serverTime: now });
 });
 
 app.get('/api/shared/feed', (req, res) => {

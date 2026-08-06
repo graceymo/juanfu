@@ -4426,6 +4426,10 @@ function openPage(name, params) {
   document.getElementById('modalTitle').textContent = data.title;
   document.getElementById('modalBody').innerHTML = data.body;
   document.getElementById('recordModal').classList.add('show');
+  // bio 页面：异步拉取好友的公开日程
+  if (name === 'bio' && params && params.memberName && params.memberName !== appState.nick) {
+    refreshBioMemberSchedules(params.memberName);
+  }
 }
 
 function openShareCircle() {
@@ -7327,6 +7331,89 @@ function cancelMyPublicSchedule(dateStr, idx) {
   }
 }
 
+// 异步刷新 bio 页面中好友的公开日程（非 seed 成员从服务端拉取）
+async function refreshBioMemberSchedules(memberName) {
+  if (!memberName) return;
+  var containerId = 'bio-mbr-sched-' + memberName.replace(/[^a-zA-Z0-9\u4e00-\u9fa5_]/g, '_');
+  var container = document.getElementById(containerId);
+  if (!container) return; // 可能已从缓存渲染，不需要异步更新
+
+  var sched = await fetchMemberPublicSchedules(memberName);
+  var allItems = [];
+  var mKeys = Object.keys(sched || {}).filter(function(k) { return sched[k] && sched[k].length > 0; });
+  mKeys.sort().forEach(function(date) {
+    (sched[date] || []).forEach(function(it, i) {
+      if (it.isPublic) allItems.push({ date: date, idx: i, it: it });
+    });
+  });
+
+  if (allItems.length === 0) {
+    container.innerHTML = '<div style="font-size:13px;color:var(--text-3);padding:12px 0">📅 ' + memberName + ' 暂无公开日程</div>';
+    return;
+  }
+
+  var firstDate = allItems[0].date.slice(5);
+  var lastDate = allItems[allItems.length - 1].date.slice(5);
+  var dateRangeStr = (firstDate === lastDate) ? firstDate : (firstDate + ' ~ ' + lastDate);
+  var memberNameSafe = memberName.replace(/'/g, "\\'");
+
+  function getJoinStatus(memberName, dateStr, idx) {
+    var memberSched = (appState.memberSchedules && appState.memberSchedules[memberName]) || {};
+    var tgt = (memberSched[dateStr] || [])[idx];
+    if (tgt && (tgt.joinedBy || []).includes(appState.nick)) return 'joined';
+    var pending = (window._joinRequests && window._joinRequests[memberName] || [])
+      .find(function(r) { return r.dateStr === dateStr && r.scheduleIdx === idx && r.fromName === appState.nick && r.status === 'pending'; });
+    if (pending) return 'pending';
+    return 'none';
+  }
+
+  container.innerHTML =
+    '<div style="font-size:14px;font-weight:600;margin-bottom:8px">📅 ' + dateRangeStr + ' ' + memberName + ' 的公开日程</div>' +
+    allItems.map(function(entry) {
+      var it = entry.it, date = entry.date, i = entry.idx;
+      var typeLabel = it.type === 'special' ? '专项' : '日常';
+      var typeColor = it.type === 'special' ? 'var(--purple)' : 'var(--green)';
+      var joinedBy = it.joinedBy || [];
+      var joinStatus = getJoinStatus(memberName, date, i);
+      var actionHtml;
+      if (joinStatus === 'joined') {
+        actionHtml = '<div style="background:rgba(52,199,89,0.15);color:var(--green);padding:4px 10px;border-radius:6px;font-size:12px;font-weight:600">已加入 ✓</div>';
+      } else if (joinStatus === 'pending') {
+        actionHtml = '<div style="background:rgba(255,255,255,0.08);color:var(--text-3);padding:4px 10px;border-radius:6px;font-size:12px;font-weight:600">待批准…</div>';
+      } else {
+        actionHtml = '<button type="button" style="background:var(--blue);color:#fff;border:0;padding:4px 10px;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600" onclick="requestJoinSchedule(\'' + memberNameSafe + '\', \'' + date + '\', ' + i + ')">一起？</button>';
+      }
+      var joinedTag = '';
+      if (joinedBy.length > 0) {
+        joinedTag = ' <span style="font-size:10px;color:var(--green);margin-left:4px">· ' + joinedBy.join('、') + ' 已加入</span>';
+      }
+      var iJoinedTag = '';
+      if (joinStatus === 'joined') {
+        iJoinedTag = ' <span style="font-size:10px;color:var(--green);margin-left:4px">我已加入</span>';
+      }
+      var md = date.slice(5);
+      return '<div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-top:1px solid var(--separator);flex-wrap:wrap">' +
+        '<span style="font-size:11px;color:var(--text-3);min-width:36px;font-weight:600">' + md + '</span>' +
+        '<span class="time-badge" style="background:var(--bg-elev-2);color:var(--text);padding:2px 6px;border-radius:4px;font-size:12px;font-weight:600">' + (it.time || '00:00') + '</span>' +
+        '<span style="flex:1;font-size:13px;min-width:120px">' + (it.name || '未命名') + iJoinedTag + joinedTag + '</span>' +
+        '<span style="font-size:10px;color:' + typeColor + ';background:rgba(255,255,255,0.05);padding:1px 5px;border-radius:3px">' + typeLabel + '·' + (it.duration || 0) + 'min</span>' +
+        actionHtml +
+      '</div>';
+    }).join('');
+}
+
+// 后台定期刷新圈子中非种子成员的公开日程
+async function refreshCircleMemberSchedules(circle) {
+  if (!circle || !circle.memberList) return;
+  var seedNames = ['Kenny', 'Monk'];
+  var promises = circle.memberList.map(function(m) {
+    var name = m.name || m;
+    if (seedNames.includes(name) || isSameNick(name, appState.nick)) return null;
+    return fetchMemberPublicSchedules(name).catch(function(){ return {}; });
+  }).filter(Boolean);
+  await Promise.all(promises);
+}
+
 // ======================== 场景 7 增强：邀约朋友加入"我的日程" ========================
 // 设计：用户在编辑自己日程时点"📨 邀请" → 弹"选择好友"列表 → 选人后
 //       把我的这条日程复制到对方的 memberSchedules（mock 后端存储）+ 双方发通知 + 1.5s 模拟接受
@@ -9171,12 +9258,62 @@ function saveAppState() {
         }
       });
     }
+    // 发布当前用户的公开日程到共享端点（让好友能在 bio 看到）
+    publishMyPublicSchedules();
   } catch(e) {
     updateSyncDebugPanel('save-exception', {
       changed: false,
       error: e && e.message ? e.message : String(e),
       note: 'saveAppState异常'
     });
+  }
+}
+
+// 将当前用户的公开日程发布到 shared_member_schedules 表
+function publishMyPublicSchedules() {
+  if (!appState.nick || !appState.schedulePublic) return;
+  var publicItems = {};
+  var scheduleKeys = Object.keys(appState.schedule || {});
+  scheduleKeys.forEach(function(dateStr) {
+    var items = (appState.schedule[dateStr] || []).filter(function(it) { return it.isPublic; });
+    if (items.length > 0) publicItems[dateStr] = items;
+  });
+  if (Object.keys(publicItems).length === 0) publicItems = {};
+
+  var active = appState.circles.find(function(c) { return c.id === appState.activeCircleId; }) || appState.circles[0];
+  var circleId = active ? active.id : 'default';
+  try {
+    var payload = { memberName: appState.nick, circleId: circleId, schedule: publicItems };
+    fetch('/api/shared/member-schedules', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }).catch(function(){});
+  } catch(_) {}
+}
+
+// 从服务端拉取某个成员的公开日程，填充到 appState.memberSchedules
+async function fetchMemberPublicSchedules(memberName) {
+  if (!memberName) return {};
+  try {
+    var resp = await fetch('/api/shared/member-schedules?memberName=' + encodeURIComponent(memberName));
+    if (!resp.ok) return {};
+    var data = await resp.json();
+    var schedules = data.schedules || {};
+    if (!appState.memberSchedules) appState.memberSchedules = {};
+    // 合并所有圈子的日程到 memberSchedules[memberName]
+    var merged = {};
+    Object.keys(schedules).forEach(function(circleId) {
+      var circleSched = schedules[circleId] || {};
+      Object.keys(circleSched).forEach(function(dateStr) {
+        if (!merged[dateStr]) merged[dateStr] = [];
+        merged[dateStr] = merged[dateStr].concat(circleSched[dateStr]);
+      });
+    });
+    appState.memberSchedules[memberName] = merged;
+    return merged;
+  } catch(_) {
+    return {};
   }
 }
 
@@ -10045,11 +10182,30 @@ function bioBody(params) {
       var mSched = getMemberSchedule(member.name || memberName);
       var allItems = [];
       var mKeys = Object.keys(mSched).filter(function(k) { return mSched[k] && mSched[k].length > 0; });
-      mKeys.sort().forEach(function(date) {
-        mSched[date].forEach(function(it, i) {
-          if (it.isPublic) allItems.push({ date: date, idx: i, it: it });
+      // 如果是 seed 数据（Kenny/Monk），直接走原逻辑；否则先尝试缓存，缓存空则走 placeholder + 异步加载
+      var isSeedMember = (member.name === 'Kenny' || member.name === 'Monk');
+      if (!isSeedMember && mKeys.length === 0) {
+        // 非 seed 成员且本地无缓存 → 先检查 memberSchedules 是否已有数据
+        var cachedSched = (appState.memberSchedules && appState.memberSchedules[member.name || memberName]);
+        if (cachedSched && Object.keys(cachedSched).some(function(k) { return (cachedSched[k] || []).length > 0; })) {
+          mSched = cachedSched;
+        } else {
+          // 占位：异步加载后通过 refreshBioMemberSchedules 更新 DOM
+          var memberIdSafe = 'bio-mbr-sched-' + (member.name || memberName).replace(/[^a-zA-Z0-9\u4e00-\u9fa5_]/g, '_');
+          memberSchedulesHtml = '<div id="' + memberIdSafe + '" class="card-elev-2" style="border-radius:12px;padding:14px;margin:0 0 12px;text-align:center">' +
+            '<div style="font-size:13px;color:var(--text-3)">📅 加载公开日程中…</div></div>';
+        }
+      }
+      if (!memberSchedulesHtml) {
+        mKeys = Object.keys(mSched).filter(function(k) { return mSched[k] && mSched[k].length > 0; });
+      }
+      if (mKeys.length > 0) {
+        mKeys.sort().forEach(function(date) {
+          mSched[date].forEach(function(it, i) {
+            if (it.isPublic) allItems.push({ date: date, idx: i, it: it });
+          });
         });
-      });
+      }
       if (allItems.length > 0) {
         // 头部日期：取最早一条的日期（多条时显示范围）
         var firstDate = allItems[0].date.slice(5);
@@ -10605,6 +10761,8 @@ if (loadAppState()) {
       if (changed && (!silent || isCommunityTabActive())) {
         _origRenderCommunityFeed();
       }
+      // 定期刷新圈子成员中非 seed 成员的公开日程（非阻塞）
+      refreshCircleMemberSchedules(active);
     } catch (err) {
       // 不要因一次网络抖动永久关闭 shared：否则后续只走本地，导致他端看不到帖子
       if (!silent) showToast('共享数据拉取失败，将自动重试');
