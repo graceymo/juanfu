@@ -167,6 +167,25 @@ db.exec(`
     PRIMARY KEY (member_name, circle_id)
   );
 
+  CREATE TABLE IF NOT EXISTS shared_invitations (
+    id TEXT PRIMARY KEY,
+    from_name TEXT NOT NULL,
+    to_name TEXT NOT NULL,
+    circle_id TEXT NOT NULL DEFAULT 'default',
+    date_str TEXT NOT NULL,
+    sport TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'daily',
+    duration INTEGER DEFAULT 0,
+    time TEXT NOT NULL DEFAULT '',
+    location TEXT DEFAULT '',
+    sched_idx INTEGER DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending / accepted / declined
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_shared_invitations_to_status ON shared_invitations(to_name, status);
+  CREATE INDEX IF NOT EXISTS idx_shared_invitations_from ON shared_invitations(from_name);
+
   CREATE INDEX IF NOT EXISTS idx_shared_posts_updated_at ON shared_posts(updated_at DESC);
   CREATE INDEX IF NOT EXISTS idx_shared_comments_post ON shared_comments(post_id, created_at ASC);
 `);
@@ -654,6 +673,41 @@ app.post('/api/shared/member-schedules', (req, res) => {
     ON CONFLICT(member_name, circle_id) DO UPDATE SET schedule_json=excluded.schedule_json, updated_at=excluded.updated_at
   `).run(memberName, circleId, scheduleJson, now);
   res.json({ ok: true, memberName, circleId, serverTime: now });
+});
+
+// ── API: Shared invitations (cross-user invite notifications) ──
+
+// POST /api/shared/invitations — sender posts an invitation
+app.post('/api/shared/invitations', (req, res) => {
+  const { fromName, toName, circleId, dateStr, sport, type, duration, time, location, schedIdx } = req.body || {};
+  if (!fromName || !toName || !dateStr) return res.status(400).json({ error: 'fromName, toName, dateStr required' });
+  const now = nowISO();
+  const id = 'inv-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+  db.prepare(`
+    INSERT INTO shared_invitations (id, from_name, to_name, circle_id, date_str, sport, type, duration, time, location, sched_idx, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+  `).run(id, fromName, toName, circleId || 'default', dateStr, sport || '', type || 'daily', duration || 0, time || '', location || '', schedIdx || 0, now, now);
+  res.json({ ok: true, id, serverTime: now });
+});
+
+// GET /api/shared/invitations?forMember=Gracey — recipient polls for pending invitations
+app.get('/api/shared/invitations', (req, res) => {
+  const { forMember } = req.query;
+  if (!forMember) return res.status(400).json({ error: 'forMember required' });
+  const rows = db.prepare('SELECT * FROM shared_invitations WHERE to_name=? AND status=\'pending\' ORDER BY created_at DESC').all(forMember);
+  res.json({ invitations: rows, serverTime: nowISO() });
+});
+
+// POST /api/shared/invitations/:id/respond — recipient accepts/declines
+app.post('/api/shared/invitations/:id/respond', (req, res) => {
+  const { id: invId } = req.params;
+  const { status } = req.body || {};  // 'accepted' | 'declined'
+  if (!invId || !status) return res.status(400).json({ error: 'id and status required' });
+  const inv = db.prepare('SELECT * FROM shared_invitations WHERE id=?').get(invId);
+  if (!inv) return res.status(404).json({ error: 'invitation not found' });
+  const now = nowISO();
+  db.prepare('UPDATE shared_invitations SET status=?, updated_at=? WHERE id=?').run(status, now, invId);
+  res.json({ ok: true, id: invId, status, serverTime: now });
 });
 
 app.get('/api/shared/feed', (req, res) => {

@@ -7414,6 +7414,73 @@ async function refreshCircleMemberSchedules(circle) {
   await Promise.all(promises);
 }
 
+// 轮询别人发给我的邀约（在 shared feed 轮询中调用）
+async function pollIncomingInvitations() {
+  if (!appState.nick) return;
+  try {
+    var resp = await fetch('/api/shared/invitations?forMember=' + encodeURIComponent(appState.nick));
+    if (!resp.ok) return;
+    var data = await resp.json();
+    var invs = data.invitations || [];
+    if (!invs.length) return;
+    // 初始化已处理集合
+    if (!window._processedInviteIds) window._processedInviteIds = new Set();
+    invs.forEach(function(inv) {
+      // 去重：已处理过的跳过
+      if (window._processedInviteIds.has(inv.id)) return;
+      window._processedInviteIds.add(inv.id);
+      // 把日程写入被邀约方的 memberSchedules
+      if (!appState.memberSchedules) appState.memberSchedules = {};
+      if (!appState.memberSchedules[appState.nick]) appState.memberSchedules[appState.nick] = {};
+      if (!appState.memberSchedules[appState.nick][inv.date_str]) appState.memberSchedules[appState.nick][inv.date_str] = [];
+      var isDup = appState.memberSchedules[appState.nick][inv.date_str].some(function(s) {
+        return s.name === inv.sport && s.time === inv.time;
+      });
+      if (!isDup) {
+        appState.memberSchedules[appState.nick][inv.date_str].push({
+          name: inv.sport,
+          type: inv.type || 'daily',
+          duration: inv.duration || 0,
+          time: inv.time || '',
+          location: inv.location || '',
+          invitedBy: inv.from_name,
+          isPublic: true
+        });
+      }
+      // 发通知给被邀约方
+      var locStr = inv.location ? ' · 📍 ' + inv.location : '';
+      pushNotification({
+        type: 'invite_received',
+        title: '📨 ' + inv.from_name + ' 邀约你一起运动',
+        body: '想和你一起「' + inv.date_str.slice(5) + ' ' + (inv.time || '00:00') + ' ' + inv.sport + '」' + locStr,
+        notifId: 'n-inv-rcv-' + inv.id,
+        targetMember: inv.from_name,
+        dateStr: inv.date_str,
+        inviteId: inv.id,
+        fromName: inv.from_name
+      });
+      // 同步写入本地邀约池，让 acceptInviteFromNotif 能找到
+      if (!window._invitesByMember) window._invitesByMember = {};
+      if (!window._invitesByMember[inv.from_name]) window._invitesByMember[inv.from_name] = [];
+      window._invitesByMember[inv.from_name].push({
+        id: inv.id,
+        fromName: inv.from_name,
+        fromEmoji: '👤',
+        toName: inv.to_name,
+        dateStr: inv.date_str,
+        scheduleIdx: inv.sched_idx || 0,
+        sport: inv.sport,
+        time: inv.time || '',
+        duration: inv.duration || 0,
+        type: inv.type || 'daily',
+        location: inv.location || '',
+        status: 'pending',
+        _serverId: true
+      });
+    });
+  } catch(_) {}
+}
+
 // ======================== 场景 7 增强：邀约朋友加入"我的日程" ========================
 // 设计：用户在编辑自己日程时点"📨 邀请" → 弹"选择好友"列表 → 选人后
 //       把我的这条日程复制到对方的 memberSchedules（mock 后端存储）+ 双方发通知 + 1.5s 模拟接受
@@ -7552,6 +7619,27 @@ function sendMyScheduleInvite(memberName, dateStr, schedIdx) {
     dateStr,
     inviteId: invite.id
   });
+
+  // 发到共享服务端，让被邀约方轮询拿到
+  try {
+    var activeCirc = appState.circles.find(function(c) { return c.id === appState.activeCircleId; }) || appState.circles[0] || null;
+    fetch('/api/shared/invitations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fromName: appState.nick,
+        toName: memberName,
+        circleId: (activeCirc && activeCirc.id) || 'default',
+        dateStr: dateStr,
+        sport: schedItem.name,
+        type: schedItem.type || 'daily',
+        duration: schedItem.duration || 0,
+        time: schedItem.time || '',
+        location: schedItem.location || '',
+        schedIdx: schedIdx
+      })
+    }).catch(function(){});
+  } catch(_) {}
 
   // 弹层切到"等待中"状态
   showInviteWaitingPanelFromMine(memberName, invite, dateStr, schedItem);
@@ -10124,7 +10212,8 @@ function bioBody(params) {
   // 2) 别人的 bio：展示 TA 的 isPublic 日程（每条有"一起？" / "待批准" / "已加入 ✓"按钮）
   // 空态引导：当 isMe + schedulePublic 开 + 自己还没设任何公开日程时，提示去编辑器添加
   var memberSchedulesHtml = '';
-  if (appState.schedulePublic) {
+  // 查看别人 bio 时不依赖自己的 schedulePublic 设置
+  if (appState.schedulePublic || !isMe) {
     // 工具函数：判断我对这个日程的"加入状态"
     function getJoinStatus(memberName, dateStr, idx) {
       // 已加入？
@@ -10763,6 +10852,8 @@ if (loadAppState()) {
       }
       // 定期刷新圈子成员中非 seed 成员的公开日程（非阻塞）
       refreshCircleMemberSchedules(active);
+      // 拉取别人发给我的邀约（非阻塞）
+      pollIncomingInvitations();
     } catch (err) {
       // 不要因一次网络抖动永久关闭 shared：否则后续只走本地，导致他端看不到帖子
       if (!silent) showToast('共享数据拉取失败，将自动重试');
